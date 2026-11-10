@@ -19,6 +19,8 @@ mod render;
 mod reserve;
 mod settings;
 mod tray;
+mod update;
+mod volume;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
@@ -26,10 +28,15 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    GetLastError, GlobalFree, ERROR_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
+    POINT, RECT, WPARAM,
 };
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
@@ -46,7 +53,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT, VK_VOLUME_DOWN, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
-    SHQueryUserNotificationState, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+    SHQueryUserNotificationState, ShellExecuteW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -151,6 +158,10 @@ struct App {
     system_light: bool,
     ticks: u32,
     seek_override: Option<SeekOverride>,
+    /// Volume level to show for a moment after the wheel changed it.
+    volume_flash: Option<(u8, Instant)>,
+    /// Message to show for a moment in place of the title.
+    notice: Option<(String, Instant)>,
 }
 
 /// What a click asks for, carried out once the app state is released.
@@ -446,6 +457,7 @@ impl App {
 
     fn apply_config(&mut self) {
         media::SPOTIFY_ONLY.store(self.cfg.spotify_only, Ordering::Relaxed);
+        update::ENABLED.store(self.cfg.check_updates, Ordering::Relaxed);
         self.sync_tray(false);
         for w in &mut self.widgets {
             w.last_frame = None;
@@ -515,6 +527,12 @@ impl App {
         }
         if self.seek_override.as_ref().is_some_and(|o| o.at.elapsed() > Duration::from_secs(3)) {
             self.seek_override = None;
+        }
+        if self.volume_flash.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(1500)) {
+            self.volume_flash = None;
+        }
+        if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(1300)) {
+            self.notice = None;
         }
 
         let bars = wanted_taskbars(&self.cfg);
@@ -586,6 +604,7 @@ impl App {
                 width: self.cfg.width,
                 show_times: self.cfg.show_times,
                 mini: false,
+                extra: self.cfg.extra_buttons && (self.snap.can_shuffle || self.snap.can_repeat),
             };
             let mut params = base;
             let mut layout = Layout::new(&params);
@@ -727,6 +746,14 @@ impl App {
             dragging: widget.dragging,
             scroll,
             scroll_px,
+            can_shuffle: self.snap.can_shuffle,
+            shuffle: self.snap.shuffle,
+            can_repeat: self.snap.can_repeat,
+            repeat: self.snap.repeat,
+            accent: self.cfg.accent,
+            volume: self.volume_flash.as_ref().map(|(level, _)| *level),
+            notice: self.notice.as_ref().map(|(text, _)| text.clone()),
+            update: update::available().is_some(),
         };
         if widget.last_frame.as_ref() != Some(&frame) {
             let art = self.snap.art.clone();
@@ -830,6 +857,28 @@ impl App {
                     Hit::Play if self.snap.can_toggle => {
                         let _ = self.tx.send(Cmd::Toggle);
                     }
+                    Hit::Shuffle if self.snap.can_shuffle => {
+                        let _ = self.tx.send(Cmd::Shuffle(!self.snap.shuffle));
+                    }
+                    Hit::Repeat if self.snap.can_repeat => {
+                        // Off -> repeat all -> repeat one -> off.
+                        let next = match self.snap.repeat {
+                            0 => 2,
+                            2 => 1,
+                            _ => 0,
+                        };
+                        let _ = self.tx.send(Cmd::Repeat(next));
+                    }
+                    Hit::Title if self.cfg.click_copy && !self.snap.title.is_empty() => {
+                        let text = if self.snap.artist.is_empty() {
+                            self.snap.title.clone()
+                        } else {
+                            format!("{} - {}", self.snap.artist, self.snap.title)
+                        };
+                        let done = copy_to_clipboard(self.widgets[i].hwnd, &text);
+                        let message = if done { "Copied to clipboard" } else { "Could not copy" };
+                        self.notice = Some((message.to_string(), Instant::now()));
+                    }
                     _ => {}
                 }
             }
@@ -866,14 +915,42 @@ fn show_menu(hwnd: HWND) {
     const ID_OPEN: usize = 1;
     const ID_SETTINGS: usize = 2;
     const ID_EXIT: usize = 3;
+    const ID_UPDATE: usize = 4;
+    const ID_AUTO: usize = 99;
+    const ID_PLAYER: usize = 100;
 
-    let Some((app_id, module)) = with_app(|a| (a.snap.app_id.clone(), a.module)) else { return };
+    let Some((app_id, sessions, module, tx)) =
+        with_app(|a| (a.snap.app_id.clone(), a.snap.sessions.clone(), a.module, a.tx.clone()))
+    else {
+        return;
+    };
+    let preferred = media::preferred();
+    let newer = update::available();
 
     // The menu runs its own message loop, so the app state must not be
     // borrowed while it is open.
     let choice = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
+        if let Some(version) = &newer {
+            let text = HSTRING::from(format!("Get version {version}..."));
+            let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, &text);
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        }
         let _ = AppendMenuW(menu, MF_STRING, ID_OPEN, w!("Open player"));
+        // With more than one player around, let the user pick.
+        if sessions.len() > 1 {
+            if let Ok(players) = CreatePopupMenu() {
+                let auto = if preferred.is_none() { MF_CHECKED } else { MF_UNCHECKED };
+                let _ = AppendMenuW(players, MF_STRING | auto, ID_AUTO, w!("Automatic"));
+                let _ = AppendMenuW(players, MF_SEPARATOR, 0, None);
+                for (i, id) in sessions.iter().enumerate().take(50) {
+                    let check = if preferred.as_ref() == Some(id) { MF_CHECKED } else { MF_UNCHECKED };
+                    let name = HSTRING::from(launch::display_name(id));
+                    let _ = AppendMenuW(players, MF_STRING | check, ID_PLAYER + i, &name);
+                }
+                let _ = AppendMenuW(menu, MF_POPUP, players.0 as usize, w!("Player"));
+            }
+        }
         let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings..."));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
@@ -899,8 +976,52 @@ fn show_menu(hwnd: HWND) {
     match choice {
         ID_OPEN => launch::open_app(&app_id),
         ID_SETTINGS => settings::open(module),
+        ID_UPDATE => open_releases_page(),
         ID_EXIT => unsafe { PostQuitMessage(0) },
+        ID_AUTO => {
+            media::set_preferred(None);
+            let _ = tx.send(Cmd::Refresh);
+        }
+        n if n >= ID_PLAYER && n < ID_PLAYER + sessions.len() => {
+            media::set_preferred(Some(sessions[n - ID_PLAYER].clone()));
+            let _ = tx.send(Cmd::Refresh);
+        }
         _ => {}
+    }
+}
+
+/// Open the latest release on GitHub in the default browser.
+pub fn open_releases_page() {
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(update::RELEASES_URL), None, None, SW_SHOWNORMAL);
+    }
+}
+
+/// Put text on the clipboard. Returns false if the clipboard was busy.
+fn copy_to_clipboard(owner: HWND, text: &str) -> bool {
+    const CF_UNICODETEXT: u32 = 13;
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        if OpenClipboard(Some(owner)).is_err() {
+            return false;
+        }
+        let mut done = false;
+        if EmptyClipboard().is_ok() {
+            if let Ok(memory) = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) {
+                let target = GlobalLock(memory) as *mut u16;
+                if !target.is_null() {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), target, wide.len());
+                    let _ = GlobalUnlock(memory);
+                    // On success the clipboard owns the memory.
+                    done = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(memory.0))).is_ok();
+                }
+                if !done {
+                    let _ = GlobalFree(Some(memory));
+                }
+            }
+        }
+        let _ = CloseClipboard();
+        done
     }
 }
 
@@ -956,8 +1077,22 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
             if GetKeyState(VK_SHIFT.0 as i32) < 0 {
                 with_widget(hwnd, |a, i| a.nudge(i, if delta > 0 { 4 } else { -4 }));
-            } else if delta != 0 && with_app(|a| a.cfg.wheel_volume) == Some(true) {
-                volume_step(delta > 0);
+            } else if delta != 0 {
+                // 1: system volume. 2: the player's own volume, falling back
+                // to system volume when the player has no mixer entry.
+                let (mode, app_id) = with_app(|a| (a.cfg.wheel_mode, a.snap.app_id.clone()))
+                    .unwrap_or((0, String::new()));
+                let level = if mode == 2 { volume::adjust(&app_id, delta > 0) } else { None };
+                match level {
+                    Some(level) => {
+                        with_app(|a| {
+                            a.volume_flash = Some((level, Instant::now()));
+                            a.tick();
+                        });
+                    }
+                    None if mode != 0 => volume_step(delta > 0),
+                    None => {}
+                }
             }
             LRESULT(0)
         }
@@ -1065,6 +1200,7 @@ fn main() {
 
         let cfg = Config::load();
         media::SPOTIFY_ONLY.store(cfg.spotify_only, Ordering::Relaxed);
+        update::ENABLED.store(cfg.check_updates, Ordering::Relaxed);
 
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let (tx, rx) = channel::<Cmd>();
@@ -1073,6 +1209,7 @@ fn main() {
             let shared = shared.clone();
             std::thread::spawn(move || media::run(shared, rx, &CONTROLLER_HWND, WM_APP_UPDATE));
         }
+        update::spawn(&CONTROLLER_HWND, WM_APP_UPDATE);
 
         APP.with(|cell| {
             *cell.borrow_mut() = Some(App {
@@ -1090,6 +1227,8 @@ fn main() {
                 system_light: false,
                 ticks: 0,
                 seek_override: None,
+                volume_flash: None,
+                notice: None,
             });
         });
         SetTimer(Some(controller), TIMER_ID, TICK_MS, None);

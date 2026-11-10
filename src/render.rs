@@ -50,6 +50,9 @@ pub enum Hit {
     Prev,
     Play,
     Next,
+    Shuffle,
+    Repeat,
+    Title,
     Seek,
 }
 
@@ -69,6 +72,8 @@ pub struct LayoutParams {
     pub show_times: bool,
     /// Art and buttons only, for when there is no room for the text.
     pub mini: bool,
+    /// Shuffle and repeat buttons after the transport buttons.
+    pub extra: bool,
 }
 
 impl LayoutParams {
@@ -89,6 +94,8 @@ pub struct Layout {
     pub gear: Rect,
     pub art: Rect,
     pub buttons: [Rect; 3],
+    /// Shuffle and repeat; zero-sized when not shown.
+    pub extras: [Rect; 2],
     pub row1: Rect,
     pub row2: Rect,
     pub elapsed: Rect,
@@ -124,7 +131,16 @@ impl Layout {
         let by = ((h - bh) / 2.0).round();
         let buttons = [0.0, 1.0, 2.0].map(|i| Rect { x: bx + i * bw, y: by, w: bw, h: bh });
 
-        let tx = bx + 3.0 * bw + (8.0 * u).round();
+        let extra = p.extra && !p.mini;
+        let ew = if extra { (23.0 * u).round() } else { 0.0 };
+        let ex = bx + 3.0 * bw + if extra { (2.0 * u).round() } else { 0.0 };
+        let extras = if extra {
+            [0.0, 1.0].map(|i| Rect { x: ex + i * ew, y: by, w: ew, h: bh })
+        } else {
+            [Rect::default(); 2]
+        };
+
+        let tx = ex + 2.0 * ew + (8.0 * u).round();
         if p.mini {
             return Layout {
                 width: bx + 3.0 * bw + (6.0 * u).round(),
@@ -174,6 +190,7 @@ impl Layout {
             gear,
             art,
             buttons,
+            extras,
             row1,
             row2,
             elapsed,
@@ -199,6 +216,18 @@ impl Layout {
             if x >= b.x && x < b.x + b.w {
                 return [Hit::Prev, Hit::Play, Hit::Next][i];
             }
+        }
+        for (i, b) in self.extras.iter().enumerate() {
+            if b.w > 0.0 && x >= b.x && x < b.x + b.w {
+                return [Hit::Shuffle, Hit::Repeat][i];
+            }
+        }
+        if self.row1.w > 0.0
+            && x >= self.row1.x
+            && x < self.row1.x + self.row1.w
+            && y < self.row2.y - 3.0 * self.u
+        {
+            return Hit::Title;
         }
         Hit::None
     }
@@ -238,6 +267,19 @@ pub struct Frame {
     pub scroll: bool,
     /// How far the title is currently scrolled, in pixels.
     pub scroll_px: i32,
+    pub can_shuffle: bool,
+    pub shuffle: bool,
+    pub can_repeat: bool,
+    /// 0 off, 1 track, 2 list.
+    pub repeat: u8,
+    /// Color the seek bar from the album art.
+    pub accent: bool,
+    /// Volume percentage to show briefly in place of the seek bar.
+    pub volume: Option<u8>,
+    /// Short message to show briefly in place of the title.
+    pub notice: Option<String>,
+    /// Mark the settings gear: a newer version is available.
+    pub update: bool,
 }
 
 /// A widget's album art, decoded and scaled to the size it is drawn at.
@@ -245,6 +287,8 @@ pub struct ArtCache {
     art_gen: u64,
     size: i32,
     bitmap: *mut GpBitmap,
+    /// The art's dominant color as (hue 0..6, saturation 0..1), if it has one.
+    accent: Option<(f32, f32)>,
 }
 
 impl Drop for ArtCache {
@@ -441,6 +485,12 @@ unsafe fn draw(
         fill_round_color(g, c, r, 3.0 * u);
     }
     draw_gear(g, l.gear.cx(), l.gear.cy(), l.gear.w * 0.40, if f.hover == Hit::Gear { primary } else { dim });
+    if f.update {
+        let r = 2.2 * u;
+        let brush = solid(0xFF4C_C2FF);
+        GdipFillEllipse(g, brush, l.gear.x + l.gear.w - r, l.gear.y - r * 0.4, r * 2.0, r * 2.0);
+        GdipDeleteBrush(brush);
+    }
 
     // ---- album art -------------------------------------------------------
     let size = l.art.w as i32;
@@ -449,7 +499,8 @@ unsafe fn draw(
     }
     if cache.is_none() && f.has_art {
         if let Some(bitmap) = art.and_then(|bytes| scale_art(bytes, size, spotify)) {
-            *cache = Some(ArtCache { art_gen: f.art_gen, size, bitmap });
+            let accent = art_accent(bitmap, size);
+            *cache = Some(ArtCache { art_gen: f.art_gen, size, bitmap, accent });
         }
     }
     match cache {
@@ -509,6 +560,68 @@ unsafe fn draw(
         GdipDeleteBrush(brush);
     }
 
+    let accent = if f.accent && f.has_art {
+        cache.as_ref().and_then(|c| c.accent).map(|hs| accent_color(hs, f.light))
+    } else {
+        None
+    };
+
+    // ---- shuffle and repeat ------------------------------------------------
+    if l.extras[0].w > 0.0 {
+        let kinds = [Hit::Shuffle, Hit::Repeat];
+        let enabled = [f.can_shuffle, f.can_repeat];
+        let active = [f.shuffle, f.repeat != 0];
+        for i in 0..2 {
+            let b = l.extras[i];
+            if enabled[i] && f.hover == kinds[i] {
+                let c = if f.pressed == kinds[i] { plate_down } else { plate };
+                fill_round_color(g, c, b, radius);
+            }
+            let color = if !enabled[i] {
+                disabled
+            } else if active[i] {
+                accent.unwrap_or(primary)
+            } else {
+                dim
+            };
+            let (cx, cy) = (b.cx(), b.cy() - 1.0 * u);
+            let mut pen: *mut GpPen = null_mut();
+            GdipCreatePen1(color, 1.5 * u, UnitPixel, &mut pen);
+            let brush = solid(color);
+            if !pen.is_null() {
+                GdipSetPenLineCap197819(pen, LineCapRound, LineCapRound, DashCapRound);
+                GdipSetPenLineJoin(pen, LineJoinRound);
+                if i == 0 {
+                    // Two crossing strands with arrowheads.
+                    for dir in [1.0f32, -1.0] {
+                        let (y0, y1) = (cy + 3.5 * u * dir, cy - 3.5 * u * dir);
+                        GdipDrawBezier(g, pen, cx - 6.0 * u, y0, cx - 1.0 * u, y0, cx + 0.5 * u, y1, cx + 4.0 * u, y1);
+                        polygon(g, brush, &[(cx + 3.6 * u, y1 - 2.6 * u), (cx + 3.6 * u, y1 + 2.6 * u), (cx + 6.8 * u, y1)]);
+                    }
+                } else {
+                    // A loop with an arrowhead; "1" inside when repeating one track.
+                    let r = Rect { x: cx - 6.0 * u, y: cy - 3.6 * u, w: 12.0 * u, h: 7.2 * u };
+                    stroke_round(g, pen, r, 3.2 * u);
+                    polygon(g, brush, &[(cx - 0.4 * u, r.y - 2.6 * u), (cx - 0.4 * u, r.y + 2.6 * u), (cx + 2.8 * u, r.y)]);
+                    if f.repeat == 1 {
+                        let font = make_font(w!("Segoe UI Semibold"), 7.5 * u);
+                        let fmt = make_format(StringAlignmentCenter, false);
+                        let box1 = Rect { x: cx - 5.0 * u, y: cy - 4.4 * u, w: 10.0 * u, h: 9.0 * u };
+                        draw_text(g, "1", font, box1, fmt, color);
+                        GdipDeleteFont(font);
+                        GdipDeleteStringFormat(fmt);
+                    }
+                }
+                GdipDeletePen(pen);
+            }
+            if enabled[i] && active[i] {
+                let d = 1.3 * u;
+                GdipFillEllipse(g, brush, cx - d, cy + 7.2 * u, d * 2.0, d * 2.0);
+            }
+            GdipDeleteBrush(brush);
+        }
+    }
+
     // ---- text and seek bar -------------------------------------------------
     if f.params.mini {
         return 0.0;
@@ -523,8 +636,12 @@ unsafe fn draw(
 
     // Row 1: "Title · Artist" when there is a seek bar underneath, otherwise
     // just the title (the artist then gets row 2 to itself).
-    let title = if f.title.is_empty() { "Unknown track" } else { f.title.as_str() };
-    let artist = if f.has_timeline && !f.artist.is_empty() {
+    let title = match &f.notice {
+        Some(notice) => notice.as_str(),
+        None if f.title.is_empty() => "Unknown track",
+        None => f.title.as_str(),
+    };
+    let artist = if f.notice.is_none() && f.has_timeline && !f.artist.is_empty() {
         format!("\u{00B7} {}", f.artist)
     } else {
         String::new()
@@ -552,7 +669,24 @@ unsafe fn draw(
         }
     }
 
-    if f.has_timeline {
+    if let Some(volume) = f.volume {
+        // Brief volume read-out in place of the seek bar.
+        let label_w = 34.0 * ts;
+        let label = Rect { x: l.row2.x + l.row2.w - label_w, w: label_w, ..l.row2 };
+        draw_text(g, &format!("{volume}%"), small_font, label, far, dim);
+        let h = (3.0 * u).round().max(2.0);
+        let t = Rect {
+            x: l.row2.x + 1.0 * u,
+            y: (l.row2.cy() - h / 2.0).round(),
+            w: (l.row2.w - label_w - 6.0 * u).max(10.0),
+            h,
+        };
+        fill_round_color(g, alpha(fg, 0x3A), t, h / 2.0);
+        let fill = t.w * volume.min(100) as f32 / 100.0;
+        if fill >= 1.0 {
+            fill_round_color(g, accent.unwrap_or(primary), Rect { w: fill.max(h), ..t }, h / 2.0);
+        }
+    } else if f.has_timeline {
         if f.params.show_times {
             draw_text(g, &f.elapsed, small_font, l.elapsed, near, dim);
             draw_text(g, &f.total, small_font, l.total, far, dim);
@@ -562,7 +696,7 @@ unsafe fn draw(
         fill_round_color(g, alpha(fg, 0x3A), t, t.h / 2.0);
         let fill = (f.fill * t.w).clamp(0.0, t.w);
         if fill >= 1.0 {
-            let color = if f.can_seek { primary } else { dim };
+            let color = if f.can_seek { accent.unwrap_or(primary) } else { dim };
             fill_round_color(g, color, Rect { w: fill.max(t.h), ..t }, t.h / 2.0);
         }
         if f.can_seek && (f.hover == Hit::Seek || f.dragging) {
@@ -637,6 +771,84 @@ unsafe fn fill_round(g: *mut GpGraphics, brush: *mut GpBrush, r: Rect, radius: f
     GdipClosePathFigure(path);
     GdipFillPath(g, brush, path);
     GdipDeletePath(path);
+}
+
+unsafe fn stroke_round(g: *mut GpGraphics, pen: *mut GpPen, r: Rect, radius: f32) {
+    let d = (radius * 2.0).min(r.w).min(r.h).max(0.1);
+    let mut path: *mut GpPath = null_mut();
+    GdipCreatePath(FillModeAlternate, &mut path);
+    if path.is_null() {
+        return;
+    }
+    GdipAddPathArc(path, r.x, r.y, d, d, 180.0, 90.0);
+    GdipAddPathArc(path, r.x + r.w - d, r.y, d, d, 270.0, 90.0);
+    GdipAddPathArc(path, r.x + r.w - d, r.y + r.h - d, d, d, 0.0, 90.0);
+    GdipAddPathArc(path, r.x, r.y + r.h - d, d, d, 90.0, 90.0);
+    GdipClosePathFigure(path);
+    GdipDrawPath(g, pen, path);
+    GdipDeletePath(path);
+}
+
+/// The most prominent vivid color in the art, as (hue 0..6, saturation).
+/// None for artwork that is essentially grey.
+unsafe fn art_accent(bitmap: *mut GpBitmap, size: i32) -> Option<(f32, f32)> {
+    const BUCKETS: usize = 12;
+    let mut weight = [0f32; BUCKETS];
+    let mut hue_sum = [0f32; BUCKETS];
+    let mut sat_sum = [0f32; BUCKETS];
+    let steps = 14;
+    for iy in 0..steps {
+        for ix in 0..steps {
+            let (x, y) = ((ix * 2 + 1) * size / (steps * 2), (iy * 2 + 1) * size / (steps * 2));
+            let mut px = 0u32;
+            GdipBitmapGetPixel(bitmap, x, y, &mut px);
+            let r = ((px >> 16) & 0xFF) as f32 / 255.0;
+            let g = ((px >> 8) & 0xFF) as f32 / 255.0;
+            let b = (px & 0xFF) as f32 / 255.0;
+            let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+            let delta = max - min;
+            if max < 0.2 || delta < 0.12 {
+                continue;
+            }
+            let sat = delta / max;
+            let hue = if max == r {
+                ((g - b) / delta).rem_euclid(6.0)
+            } else if max == g {
+                (b - r) / delta + 2.0
+            } else {
+                (r - g) / delta + 4.0
+            };
+            let bucket = ((hue / 6.0 * BUCKETS as f32) as usize).min(BUCKETS - 1);
+            let w = sat * max;
+            weight[bucket] += w;
+            hue_sum[bucket] += hue * w;
+            sat_sum[bucket] += sat * w;
+        }
+    }
+    let best = (0..BUCKETS).max_by(|a, b| weight[*a].total_cmp(&weight[*b]))?;
+    // Needs to cover a meaningful share of the picture.
+    if weight[best] < (steps * steps) as f32 * 0.03 {
+        return None;
+    }
+    Some((hue_sum[best] / weight[best], sat_sum[best] / weight[best]))
+}
+
+/// A readable version of the art's color for the current taskbar theme.
+fn accent_color((hue, sat): (f32, f32), light_taskbar: bool) -> u32 {
+    let (s, v) = if light_taskbar { (sat.clamp(0.55, 1.0), 0.62) } else { (sat.clamp(0.40, 0.72), 1.0) };
+    let c = v * s;
+    let x = c * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match hue as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let to = |f: f32| ((f + m) * 255.0).round().clamp(0.0, 255.0) as u32;
+    0xFF00_0000 | (to(r) << 16) | (to(g) << 8) | to(b)
 }
 
 unsafe fn fill_round_color(g: *mut GpGraphics, color: u32, r: Rect, radius: f32) {

@@ -9,7 +9,8 @@ From left to right:
 
 - A small settings button
 - Album art; click it to bring up the app that is playing
-- Previous, play/pause, next
+- Previous, play/pause, next, plus shuffle and repeat when the player
+  supports them
 - Title and artist over a seek bar with elapsed / total time (click or drag)
 
 It uses Windows' own media session API, so it works with anything that shows
@@ -24,7 +25,9 @@ app area is narrowed to make room for it, and on Windows 11 the widget shrinks.
 Run `TaskbarMedia.exe`. There is no installer and no other files.
 
 - Click the gear, right-click the widget, or use the tray icon for settings
-- Mouse wheel over the widget changes the volume
+- Mouse wheel over the widget changes the player's own volume
+- Click the title to copy "Artist - Title"
+- With several players running, right-click and choose one under Player
 - Shift + mouse wheel over a widget nudges it left or right
 
 ## Settings
@@ -33,7 +36,9 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 
 - **Start with Windows**
 - **Hide while paused**
-- **Tray icon** and **wheel volume** on or off
+- **Tray icon** on or off
+- **Mouse wheel**: player volume, system volume, or nothing
+- **Check GitHub for new versions**
 - **Show media from**: any app, or Spotify only
 - **Show on**: the main taskbar, all taskbars, or one chosen display
 - **Text size**, **width**, **text color**
@@ -41,10 +46,19 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 - **Keep the widget clear of app icons**
 - **Show elapsed and total time**
 - **Scroll long titles**
+- **Color the seek bar from the album art**
+- **Shuffle and repeat buttons**, **click the title to copy**
 
 Requires Windows 10 (1809 or later) or Windows 11, 64-bit, with the taskbar at
 the bottom or top of the screen. Taskbars on other displays exist only when
 "Show my taskbar on all displays" is on in Windows taskbar settings.
+
+## Update check
+
+Unless turned off in settings, the app asks GitHub's public API a few times a
+day for this repository's latest release number. Nothing else is sent, and
+nothing is downloaded or installed: a newer version only adds a dot on the
+gear and a menu entry that opens the releases page.
 
 ## Build
 

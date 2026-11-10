@@ -129,6 +129,71 @@ unsafe fn window_matches(hwnd: HWND, app_id: &str) -> bool {
     matched
 }
 
+/// Whether process `pid` belongs to the app with this (lower-case) app id:
+/// by package identity for Store apps, otherwise by exe name.
+pub fn process_matches(pid: u32, app_id: &str) -> bool {
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut matched = false;
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        if GetApplicationUserModelId(process, &mut len, Some(PWSTR(buf.as_mut_ptr()))) == ERROR_SUCCESS {
+            let id = String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]);
+            matched = id.to_lowercase() == app_id;
+        }
+        if !matched {
+            let mut path = [0u16; 1024];
+            let mut len = path.len() as u32;
+            if QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut len)
+                .is_ok()
+            {
+                matched = exe_matches(&String::from_utf16_lossy(&path[..len as usize]), app_id);
+            }
+        }
+        let _ = CloseHandle(process);
+        matched
+    }
+}
+
+/// A readable name for an app id, for menus.
+pub fn display_name(app_id: &str) -> String {
+    let lower = app_id.to_lowercase();
+    for (needle, name) in [
+        ("spotify", "Spotify"),
+        ("msedge", "Microsoft Edge"),
+        ("chrome", "Google Chrome"),
+        ("firefox", "Firefox"),
+        ("308046b0af4a39cb", "Firefox"),
+        ("brave", "Brave"),
+        ("opera", "Opera"),
+        ("vivaldi", "Vivaldi"),
+        ("zunemusic", "Media Player"),
+        ("zunevideo", "Movies & TV"),
+        ("applemusic", "Apple Music"),
+        ("itunes", "iTunes"),
+        ("vlc", "VLC"),
+        ("foobar2000", "foobar2000"),
+        ("musicbee", "MusicBee"),
+        ("tidal", "TIDAL"),
+        ("amazon", "Amazon Music"),
+    ] {
+        if lower.contains(needle) {
+            return name.to_string();
+        }
+    }
+    // "Publisher.App_hash!Entry" -> "App"; "Some.exe" -> "Some".
+    let base = app_id.split('!').next().unwrap_or(app_id);
+    let base = base.split('_').next().unwrap_or(base);
+    let base = base.rsplit('.').find(|part| !part.eq_ignore_ascii_case("exe")).unwrap_or(base);
+    if base.is_empty() {
+        app_id.to_string()
+    } else {
+        base.to_string()
+    }
+}
+
 /// "Spotify.exe" matches spotify.exe; "Chrome" / "MSEdge" match their exe stem.
 fn exe_matches(path_or_name: &str, app_id_lower: &str) -> bool {
     let p = Path::new(path_or_name);

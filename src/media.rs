@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use windows::core::Result;
+use windows::Media::MediaPlaybackAutoRepeatMode;
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSession as Session,
     GlobalSystemMediaTransportControlsSessionManager as Manager,
@@ -31,6 +32,13 @@ pub struct Snapshot {
     pub can_next: bool,
     pub can_toggle: bool,
     pub can_seek: bool,
+    pub can_shuffle: bool,
+    pub shuffle: bool,
+    pub can_repeat: bool,
+    /// 0 off, 1 repeat the track, 2 repeat the list.
+    pub repeat: u8,
+    /// App ids of every player currently known to Windows.
+    pub sessions: Vec<String>,
     /// Timeline, in 100 ns ticks.
     pub start: i64,
     pub end: i64,
@@ -49,6 +57,11 @@ pub enum Cmd {
     Toggle,
     /// Absolute position in 100 ns ticks.
     Seek(i64),
+    Shuffle(bool),
+    /// 0 off, 1 track, 2 list.
+    Repeat(u8),
+    /// Nothing to do; just re-read the players now.
+    Refresh,
 }
 
 pub fn run(
@@ -89,6 +102,7 @@ pub fn run(
         }
         let Some(mgr) = &manager else { continue };
 
+        let sessions = session_ids(mgr);
         session = pick_session(mgr);
         let mut snap = match &session {
             Some(s) => match read_session(s) {
@@ -152,6 +166,7 @@ pub fn run(
             track_key.clear();
             snap.art = None;
         }
+        snap.sessions = sessions;
 
         if snap != last {
             last = snap.clone();
@@ -178,6 +193,36 @@ fn is_playing(s: &Session) -> bool {
 /// Set from the settings window: ignore every player except Spotify.
 pub static SPOTIFY_ONLY: AtomicBool = AtomicBool::new(false);
 
+/// The player chosen from the menu (an app id), or None to pick automatically.
+static PREFERRED: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn preferred() -> Option<String> {
+    PREFERRED.lock().ok().and_then(|p| p.clone())
+}
+
+pub fn set_preferred(app_id: Option<String>) {
+    if let Ok(mut p) = PREFERRED.lock() {
+        *p = app_id;
+    }
+}
+
+fn app_id(s: &Session) -> String {
+    s.SourceAppUserModelId().map(|id| id.to_string()).unwrap_or_default()
+}
+
+fn session_ids(mgr: &Manager) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if let Ok(list) = mgr.GetSessions() {
+        for s in list {
+            let id = app_id(&s);
+            if allowed(&s) && !id.is_empty() && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
 fn allowed(s: &Session) -> bool {
     if !SPOTIFY_ONLY.load(Ordering::Relaxed) {
         return true;
@@ -190,6 +235,16 @@ fn allowed(s: &Session) -> bool {
 /// Prefer whatever is actually playing; otherwise fall back to the session
 /// Windows considers current (the one the hardware media keys would control).
 fn pick_session(mgr: &Manager) -> Option<Session> {
+    // A player chosen from the menu wins for as long as it exists.
+    if let Some(wanted) = preferred() {
+        if let Ok(list) = mgr.GetSessions() {
+            for s in list {
+                if allowed(&s) && app_id(&s) == wanted {
+                    return Some(s);
+                }
+            }
+        }
+    }
     let current = mgr.GetCurrentSession().ok().filter(allowed);
     if let Some(c) = &current {
         if is_playing(c) {
@@ -226,7 +281,15 @@ fn read_session(s: &Session) -> Result<(Snapshot, Option<IRandomAccessStreamRefe
             || c.IsPlayEnabled().unwrap_or(false)
             || c.IsPauseEnabled().unwrap_or(false);
         snap.can_seek = c.IsPlaybackPositionEnabled().unwrap_or(false);
+        snap.can_shuffle = c.IsShuffleEnabled().unwrap_or(false);
+        snap.can_repeat = c.IsRepeatEnabled().unwrap_or(false);
     }
+    snap.shuffle = info.IsShuffleActive().and_then(|v| v.Value()).unwrap_or(false);
+    snap.repeat = match info.AutoRepeatMode().and_then(|v| v.Value()) {
+        Ok(MediaPlaybackAutoRepeatMode::Track) => 1,
+        Ok(MediaPlaybackAutoRepeatMode::List) => 2,
+        _ => 0,
+    };
     if let Ok(rate) = info.PlaybackRate().and_then(|r| r.Value()) {
         if rate.is_finite() && rate > 0.0 {
             snap.rate = rate;
@@ -279,6 +342,16 @@ fn execute(s: &Session, cmd: Cmd) -> Result<()> {
         Cmd::Next => s.TrySkipNextAsync()?.join()?,
         Cmd::Toggle => s.TryTogglePlayPauseAsync()?.join()?,
         Cmd::Seek(ticks) => s.TryChangePlaybackPositionAsync(ticks)?.join()?,
+        Cmd::Shuffle(on) => s.TryChangeShuffleActiveAsync(on)?.join()?,
+        Cmd::Repeat(mode) => {
+            let mode = match mode {
+                1 => MediaPlaybackAutoRepeatMode::Track,
+                2 => MediaPlaybackAutoRepeatMode::List,
+                _ => MediaPlaybackAutoRepeatMode::None,
+            };
+            s.TryChangeAutoRepeatModeAsync(mode)?.join()?
+        }
+        Cmd::Refresh => true,
     };
     Ok(())
 }

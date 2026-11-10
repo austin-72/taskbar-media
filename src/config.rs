@@ -38,8 +38,16 @@ pub struct Config {
     pub spotify_only: bool,
     /// Scroll titles that are too long to fit, instead of cutting them off.
     pub scroll_titles: bool,
-    /// Mouse wheel over the widget changes the system volume.
-    pub wheel_volume: bool,
+    /// Mouse wheel over the widget: 0 nothing, 1 system volume, 2 the
+    /// player's own volume.
+    pub wheel_mode: u32,
+    /// Shuffle and repeat buttons, for players that support them.
+    pub extra_buttons: bool,
+    /// Take the seek bar's color from the album art.
+    pub accent: bool,
+    /// Clicking the title copies "Artist - Title".
+    pub click_copy: bool,
+    pub check_updates: bool,
     /// Keep clear of app buttons: reserve space (Windows 10) or shrink (11).
     pub avoid_apps: bool,
     pub tray_icon: bool,
@@ -67,7 +75,14 @@ impl Config {
             hide_paused: d(w!("HidePaused"), 0, 1) == 1,
             spotify_only: d(w!("SpotifyOnly"), 0, 1) == 1,
             scroll_titles: d(w!("ScrollTitles"), 1, 1) == 1,
-            wheel_volume: d(w!("WheelVolume"), 1, 1) == 1,
+            // 1.0 stored on/off as WheelVolume; off stays off.
+            wheel_mode: read_dword(SETTINGS_KEY, w!("WheelMode")).filter(|v| *v <= 2).unwrap_or(
+                if read_dword(SETTINGS_KEY, w!("WheelVolume")) == Some(0) { 0 } else { 2 },
+            ),
+            extra_buttons: d(w!("ExtraButtons"), 1, 1) == 1,
+            accent: d(w!("Accent"), 1, 1) == 1,
+            click_copy: d(w!("ClickCopy"), 1, 1) == 1,
+            check_updates: d(w!("CheckUpdates"), 1, 1) == 1,
             avoid_apps: d(w!("AvoidApps"), 1, 1) == 1,
             tray_icon: d(w!("TrayIcon"), 1, 1) == 1,
             offset: off(w!("Offset")),
@@ -86,7 +101,11 @@ impl Config {
         write_dword(SETTINGS_KEY, w!("HidePaused"), self.hide_paused as u32);
         write_dword(SETTINGS_KEY, w!("SpotifyOnly"), self.spotify_only as u32);
         write_dword(SETTINGS_KEY, w!("ScrollTitles"), self.scroll_titles as u32);
-        write_dword(SETTINGS_KEY, w!("WheelVolume"), self.wheel_volume as u32);
+        write_dword(SETTINGS_KEY, w!("WheelMode"), self.wheel_mode);
+        write_dword(SETTINGS_KEY, w!("ExtraButtons"), self.extra_buttons as u32);
+        write_dword(SETTINGS_KEY, w!("Accent"), self.accent as u32);
+        write_dword(SETTINGS_KEY, w!("ClickCopy"), self.click_copy as u32);
+        write_dword(SETTINGS_KEY, w!("CheckUpdates"), self.check_updates as u32);
         write_dword(SETTINGS_KEY, w!("AvoidApps"), self.avoid_apps as u32);
         write_dword(SETTINGS_KEY, w!("TrayIcon"), self.tray_icon as u32);
         write_dword(SETTINGS_KEY, w!("Offset"), self.offset as u32);

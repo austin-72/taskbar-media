@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.0
+
+### Added
+- Shuffle and repeat buttons, shown for players that support them.
+- Player menu (right-click) to choose which app the widget follows when
+  several are playing.
+- The mouse wheel now changes the player's own volume, with a brief level
+  read-out on the widget. System volume is still available in settings.
+- The seek bar takes its color from the album art.
+- Click the title to copy "Artist - Title".
+- Update check: a dot on the gear and a menu entry when a newer release is
+  on GitHub. Can be turned off.
+- Version shown in the settings window.
+
+### Changed
+- The settings window is laid out in two columns.
+- The exe's version number now comes from Cargo.toml alone.
+- MSVC builds include the C runtime, so the exe has no VCRUNTIME140.dll
+  dependency.
+
 ## 1.0.0
 
 ### Added

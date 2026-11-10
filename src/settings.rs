@@ -20,7 +20,12 @@ const ID_AUTOSTART: i32 = 100;
 const ID_HIDE_PAUSED: i32 = 101;
 const ID_SHOW_TIMES: i32 = 102;
 const ID_TRAY: i32 = 103;
-const ID_VOLUME: i32 = 104;
+const ID_UPDATES: i32 = 104;
+const ID_WHEEL: i32 = 116;
+const ID_ACCENT: i32 = 107;
+const ID_EXTRA: i32 = 108;
+const ID_COPY: i32 = 109;
+const ID_RELEASES: i32 = 123;
 const ID_AVOID: i32 = 105;
 const ID_SCROLL: i32 = 106;
 const ID_SOURCE: i32 = 110;
@@ -45,8 +50,10 @@ const CBS_DROPDOWNLIST: u32 = 0x0003;
 const BN_CLICKED: u32 = 0;
 const CBN_SELCHANGE: u32 = 1;
 
-/// Client height at 96 dpi; must match the layout in `open`.
-const CLIENT_H: i32 = 650;
+// Window layout at 96 dpi: two columns of controls above a row of buttons.
+const COLUMN_W: i32 = 380;
+const BUTTONS_Y: i32 = 438;
+const CLIENT_H: i32 = BUTTONS_Y + 28 + 14;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -127,6 +134,8 @@ struct Builder {
     bold: HFONT,
     /// Pixels per 96-dpi unit.
     d: f32,
+    /// Horizontal offset of the column being filled, in 96-dpi units.
+    ox: std::cell::Cell<i32>,
 }
 
 impl Builder {
@@ -152,7 +161,7 @@ impl Builder {
             class,
             &HSTRING::from(text),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
-            self.px(x),
+            self.px(x + self.ox.get()),
             self.px(y),
             self.px(w),
             self.px(h),
@@ -230,7 +239,7 @@ pub fn open(module: HINSTANCE) {
 
         let cfg = crate::current_config();
         let d = GetDpiForSystem().max(96) as f32 / 96.0;
-        let (client_w, client_h) = ((380.0 * d) as i32, (CLIENT_H as f32 * d) as i32);
+        let (client_w, client_h) = (((2 * COLUMN_W) as f32 * d) as i32, (CLIENT_H as f32 * d) as i32);
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let mut wr = RECT { left: 0, top: 0, right: client_w, bottom: client_h };
         let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
@@ -281,9 +290,16 @@ pub fn open(module: HINSTANCE) {
                 w!("Segoe UI"),
             )
         };
-        let b = Builder { parent, module, font: make_font(400), bold: make_font(600), d };
+        let b = Builder {
+            parent,
+            module,
+            font: make_font(400),
+            bold: make_font(600),
+            d,
+            ox: std::cell::Cell::new(0),
+        };
 
-        // ---- General ----
+        // ---- Left column: General ----
         let mut y = 14;
         b.header("General", y);
         y += 26;
@@ -293,12 +309,20 @@ pub fn open(module: HINSTANCE) {
         y += 26;
         b.checkbox("Show an icon in the notification area", y, ID_TRAY, cfg.tray_icon);
         y += 26;
-        b.checkbox("Scroll over the widget to change the volume", y, ID_VOLUME, cfg.wheel_volume);
+        b.checkbox("Check GitHub for new versions", y, ID_UPDATES, cfg.check_updates);
         y += 30;
         b.label("Show media from", y);
         b.combo(y, ID_SOURCE, &strings(&["Any app", "Spotify only"]), cfg.spotify_only as usize);
+        y += 30;
+        b.label("Mouse wheel", y);
+        b.combo(
+            y,
+            ID_WHEEL,
+            &strings(&["Does nothing", "System volume", "Player volume"]),
+            cfg.wheel_mode as usize,
+        );
 
-        // ---- Taskbars ----
+        // ---- Left column: Taskbars ----
         y += 44;
         b.header("Taskbars", y);
         y += 26;
@@ -342,9 +366,11 @@ pub fn open(module: HINSTANCE) {
         b.checkbox("Keep the widget clear of app icons", y, ID_AVOID, cfg.avoid_apps);
         y += 30;
         b.button("Reset positions", 16, y, 130, ID_RESET_POS, false);
+        debug_assert!(y + 28 <= BUTTONS_Y - 12);
 
-        // ---- Appearance ----
-        y += 44;
+        // ---- Right column: Appearance ----
+        b.ox.set(COLUMN_W);
+        let mut y = 14;
         b.header("Appearance", y);
         y += 26;
         b.label("Text size", y);
@@ -369,15 +395,36 @@ pub fn open(module: HINSTANCE) {
             cfg.text_color as usize,
         );
         y += 34;
+        b.checkbox("Color the seek bar from the album art", y, ID_ACCENT, cfg.accent);
+        y += 26;
         b.checkbox("Show elapsed and total time", y, ID_SHOW_TIMES, cfg.show_times);
         y += 26;
         b.checkbox("Scroll titles that are too long to fit", y, ID_SCROLL, cfg.scroll_titles);
+        y += 26;
+        b.checkbox("Show shuffle and repeat buttons", y, ID_EXTRA, cfg.extra_buttons);
+        y += 26;
+        b.checkbox("Click the title to copy it", y, ID_COPY, cfg.click_copy);
+
+        // ---- Right column: About ----
+        y += 44;
+        b.header("About", y);
+        y += 26;
+        let about = match crate::update::available() {
+            Some(newer) => format!(
+                "Taskbar Media {}. Version {newer} is available.",
+                crate::update::VERSION
+            ),
+            None => format!("Taskbar Media {}", crate::update::VERSION),
+        };
+        b.control(w!("STATIC"), &about, 0, 16, y, 348, 20, -1, b.font);
+        y += 26;
+        b.button("Open the releases page", 16, y, 180, ID_RELEASES, false);
+        debug_assert!(y + 28 <= BUTTONS_Y - 12);
 
         // ---- Buttons ----
-        y += 38;
-        b.button("Exit Taskbar Media", 16, y, 150, ID_EXIT, false);
-        b.button("Close", 274, y, 90, ID_CLOSE, true);
-        debug_assert_eq!(y + 28 + 14, CLIENT_H);
+        b.ox.set(0);
+        b.button("Exit Taskbar Media", 16, BUTTONS_Y, 150, ID_EXIT, false);
+        b.button("Close", 2 * COLUMN_W - 16 - 90, BUTTONS_Y, 90, ID_CLOSE, true);
 
         let _ = ShowWindow(parent, SW_SHOWNORMAL);
         let _ = SetForegroundWindow(parent);
@@ -409,10 +456,27 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             let v = checked(hwnd, id);
             crate::update_config(|c| c.tray_icon = v);
         }
-        (ID_VOLUME, BN_CLICKED) => {
+        (ID_UPDATES, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.wheel_volume = v);
+            crate::update_config(|c| c.check_updates = v);
         }
+        (ID_WHEEL, CBN_SELCHANGE) => {
+            let v = selection(hwnd, id) as u32;
+            crate::update_config(|c| c.wheel_mode = v.min(2));
+        }
+        (ID_ACCENT, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.accent = v);
+        }
+        (ID_EXTRA, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.extra_buttons = v);
+        }
+        (ID_COPY, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.click_copy = v);
+        }
+        (ID_RELEASES, BN_CLICKED) => crate::open_releases_page(),
         (ID_AVOID, BN_CLICKED) => {
             let v = checked(hwnd, id);
             crate::update_config(|c| c.avoid_apps = v);

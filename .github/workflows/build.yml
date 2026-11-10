@@ -1,5 +1,6 @@
 # Builds TaskbarMedia.exe on every push, and attaches it to a release when one
-# is published on GitHub.
+# is published on GitHub. Can also be run by hand from the Actions tab to
+# rebuild a release's exe: enter the release tag when asked.
 name: Build
 
 on:
@@ -8,6 +9,12 @@ on:
   pull_request:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to rebuild and re-attach the exe to (for example v1.1.0). Leave empty to only build."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -17,6 +24,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Build
         run: cargo build --release --locked
@@ -28,7 +37,7 @@ jobs:
           path: target/release/TaskbarMedia.exe
 
       - name: Attach the exe to the release
-        if: github.event_name == 'release'
-        run: gh release upload "${{ github.event.release.tag_name }}" target/release/TaskbarMedia.exe --clobber
+        if: github.event_name == 'release' || inputs.tag != ''
+        run: gh release upload "${{ github.event.release.tag_name || inputs.tag }}" target/release/TaskbarMedia.exe --clobber
         env:
           GH_TOKEN: ${{ github.token }}

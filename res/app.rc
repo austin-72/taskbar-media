@@ -1,10 +1,15 @@
 // Icon, manifest and version information embedded in TaskbarMedia.exe.
+// VER_MAJOR, VER_MINOR and VER_PATCH come from Cargo.toml via build.rs.
+#define STR2(x) #x
+#define STR(x) STR2(x)
+#define VERSION_TEXT STR(VER_MAJOR) "." STR(VER_MINOR) "." STR(VER_PATCH)
+
 1 ICON "app.ico"
 1 24 "app.manifest"
 
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION VER_MAJOR,VER_MINOR,VER_PATCH,0
+PRODUCTVERSION VER_MAJOR,VER_MINOR,VER_PATCH,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -14,8 +19,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "Taskbar Media"
       VALUE "ProductName", "Taskbar Media"
-      VALUE "FileVersion", "1.0.0"
-      VALUE "ProductVersion", "1.0.0"
+      VALUE "FileVersion", VERSION_TEXT
+      VALUE "ProductVersion", VERSION_TEXT
       VALUE "InternalName", "TaskbarMedia"
       VALUE "OriginalFilename", "TaskbarMedia.exe"
     END
