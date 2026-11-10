@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.0
+
+### Added
+- Output device button: an optional widget item that switches where sound
+  plays. Click it for a list of playback devices, or set it to flip between
+  two chosen devices. Its icon shows headphones or a speaker to match the
+  current device. Turn it on in Settings, Layout.
+- "Output device" submenu in the right-click and tray menus, available even
+  with the button hidden.
+- The widget briefly names the new device after a switch.
+
 ## 1.2.0
 
 ### Added

@@ -12,6 +12,7 @@
 #![windows_subsystem = "windows"]
 
 mod config;
+mod devices;
 mod launch;
 mod media;
 mod probe;
@@ -164,6 +165,8 @@ struct App {
     volume_flash: Option<(u8, Instant)>,
     /// Message to show for a moment in place of the title.
     notice: Option<(String, Instant)>,
+    /// The current audio output, while the output button is on the widget.
+    output: Option<devices::Device>,
 }
 
 /// What a click asks for, carried out once the app state is released.
@@ -171,6 +174,10 @@ enum Action {
     None,
     Open(String),
     Settings,
+    /// Show the list of output devices.
+    Outputs,
+    /// Switch between the two chosen output devices.
+    ToggleOutput,
 }
 
 fn window_rect(hwnd: HWND) -> Option<RECT> {
@@ -532,6 +539,13 @@ impl App {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks % 10 == 1 {
             self.system_light = config::system_light_theme();
+            // The output can change behind our back (a headset is plugged
+            // in, or the user switches in Windows), so look every 2 seconds.
+            self.output = if self.cfg.order().contains(&config::ITEM_OUTPUT) && self.snap.active {
+                devices::current()
+            } else {
+                None
+            };
             self.system_accent = config::system_accent().unwrap_or(0xFF4C_C2FF);
         }
         if self.seek_override.as_ref().is_some_and(|o| o.at.elapsed() > Duration::from_secs(3)) {
@@ -540,7 +554,7 @@ impl App {
         if self.volume_flash.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(1500)) {
             self.volume_flash = None;
         }
-        if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(1300)) {
+        if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(1800)) {
             self.notice = None;
         }
 
@@ -786,6 +800,7 @@ impl App {
             volume: self.volume_flash.as_ref().map(|(level, _)| *level),
             notice: self.notice.as_ref().map(|(text, _)| text.clone()),
             update: update::available().is_some(),
+            headphones: self.output.as_ref().is_some_and(|d| d.headphones),
         };
         if widget.last_frame.as_ref() != Some(&frame) {
             let art = self.snap.art.clone();
@@ -879,6 +894,14 @@ impl App {
             if hit == self.widgets[i].pressed {
                 match hit {
                     Hit::Gear => action = Action::Settings,
+                    Hit::Output => {
+                        let both = !self.cfg.output_a.is_empty() && !self.cfg.output_b.is_empty();
+                        action = if self.cfg.output_click == 1 && both {
+                            Action::ToggleOutput
+                        } else {
+                            Action::Outputs
+                        };
+                    }
                     Hit::Art => match self.cfg.art_click {
                         0 => action = Action::Open(self.snap.app_id.clone()),
                         1 if self.snap.can_toggle => {
@@ -959,6 +982,7 @@ fn show_menu(hwnd: HWND) {
     const ID_UPDATE: usize = 4;
     const ID_AUTO: usize = 99;
     const ID_PLAYER: usize = 100;
+    const ID_OUTPUT: usize = 200;
 
     let Some((app_id, sessions, module, tx)) =
         with_app(|a| (a.snap.app_id.clone(), a.snap.sessions.clone(), a.module, a.tx.clone()))
@@ -967,6 +991,8 @@ fn show_menu(hwnd: HWND) {
     };
     let preferred = media::preferred();
     let newer = update::available();
+    let outputs = devices::list();
+    let current_output = devices::current().map(|d| d.id);
 
     // The menu runs its own message loop, so the app state must not be
     // borrowed while it is open.
@@ -992,29 +1018,20 @@ fn show_menu(hwnd: HWND) {
                 let _ = AppendMenuW(menu, MF_POPUP, players.0 as usize, w!("Player"));
             }
         }
+        if outputs.len() > 1 {
+            if let Ok(submenu) = CreatePopupMenu() {
+                append_outputs(submenu, &outputs, current_output.as_deref(), ID_OUTPUT);
+                let _ = AppendMenuW(menu, MF_POPUP, submenu.0 as usize, w!("Output device"));
+            }
+        }
         let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings..."));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
-
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        // Required so the menu closes when the user clicks elsewhere.
-        let _ = SetForegroundWindow(hwnd);
-        let choice = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-            pt.x,
-            pt.y,
-            None,
-            hwnd,
-            None,
-        );
-        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-        choice.0 as usize
+        track_menu(menu, hwnd)
     };
 
     match choice {
+        n if n >= ID_OUTPUT && n < ID_OUTPUT + outputs.len() => switch_output(&outputs[n - ID_OUTPUT]),
         ID_OPEN => launch::open_app(&app_id),
         ID_SETTINGS => settings::open(module),
         ID_UPDATE => open_releases_page(),
@@ -1029,6 +1046,91 @@ fn show_menu(hwnd: HWND) {
         }
         _ => {}
     }
+}
+
+/// Show a popup menu at the mouse and return the chosen item's id (0 if
+/// none). Destroys the menu. Must not be called with the app state borrowed:
+/// the menu runs its own message loop.
+unsafe fn track_menu(menu: HMENU, hwnd: HWND) -> usize {
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    // Required so the menu closes when the user clicks elsewhere.
+    let _ = SetForegroundWindow(hwnd);
+    let choice = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+        pt.x,
+        pt.y,
+        None,
+        hwnd,
+        None,
+    );
+    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+    let _ = DestroyMenu(menu);
+    choice.0 as usize
+}
+
+/// Add one entry per output device, ticking the current one.
+unsafe fn append_outputs(menu: HMENU, outputs: &[devices::Device], current: Option<&str>, first_id: usize) {
+    for (i, device) in outputs.iter().enumerate().take(50) {
+        let check = if current == Some(device.id.as_str()) { MF_CHECKED } else { MF_UNCHECKED };
+        // "&" would otherwise underline the next letter.
+        let name = HSTRING::from(device.name.replace('&', "&&"));
+        let _ = AppendMenuW(menu, MF_STRING | check, first_id + i, &name);
+    }
+}
+
+/// The output button's menu: every playback device, current one ticked.
+fn output_menu(hwnd: HWND) {
+    const FIRST: usize = 1;
+    let outputs = devices::list();
+    if outputs.is_empty() {
+        return;
+    }
+    let current = devices::current().map(|d| d.id);
+    let choice = unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        append_outputs(menu, &outputs, current.as_deref(), FIRST);
+        track_menu(menu, hwnd)
+    };
+    if choice >= FIRST && choice < FIRST + outputs.len() {
+        switch_output(&outputs[choice - FIRST]);
+    }
+}
+
+/// Flip between the two output devices chosen in settings.
+fn toggle_output() {
+    let Some((a, b)) = with_app(|app| (app.cfg.output_a.clone(), app.cfg.output_b.clone())) else {
+        return;
+    };
+    let current = devices::current().map(|d| d.id).unwrap_or_default();
+    let target = if current == a { b } else { a };
+    match devices::list().into_iter().find(|d| d.id == target) {
+        Some(device) => switch_output(&device),
+        None => {
+            with_app(|app| {
+                app.notice = Some(("That device is not connected".to_string(), Instant::now()));
+                app.tick();
+            });
+        }
+    }
+}
+
+/// Make `device` the default output and say so on the widget.
+fn switch_output(device: &devices::Device) {
+    let message = if devices::set_default(&device.id) {
+        format!("Output: {}", device.name)
+    } else {
+        "Could not switch output".to_string()
+    };
+    let now = devices::current();
+    with_app(|app| {
+        if app.output.is_some() {
+            app.output = now;
+        }
+        app.notice = Some((message, Instant::now()));
+        app.tick();
+    });
 }
 
 /// Open the latest release on GitHub in the default browser.
@@ -1101,6 +1203,8 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             match action {
                 Some((Action::Open(app_id), _)) => launch::open_app(&app_id),
                 Some((Action::Settings, module)) => settings::open(module),
+                Some((Action::Outputs, _)) => output_menu(hwnd),
+                Some((Action::ToggleOutput, _)) => toggle_output(),
                 _ => {}
             }
             LRESULT(0)
@@ -1110,7 +1214,13 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            show_menu(hwnd);
+            // Right-clicking the output button always lists the devices.
+            let (x, y) = point(lparam);
+            if with_widget(hwnd, |a, i| a.hit(i, x, y)) == Some(Hit::Output) {
+                output_menu(hwnd);
+            } else {
+                show_menu(hwnd);
+            }
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
@@ -1271,6 +1381,7 @@ fn main() {
                 seek_override: None,
                 volume_flash: None,
                 notice: None,
+                output: None,
             });
         });
         SetTimer(Some(controller), TIMER_ID, TICK_MS, None);

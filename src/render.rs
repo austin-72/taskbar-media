@@ -19,7 +19,7 @@ use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
 use crate::config::{
-    FONTS, ITEM_ART, ITEM_GEAR, ITEM_INFO, ITEM_NEXT, ITEM_PLAY, ITEM_PREV, ITEM_REPEAT,
+    FONTS, ITEM_COUNT, ITEM_OUTPUT, ITEM_ART, ITEM_GEAR, ITEM_INFO, ITEM_NEXT, ITEM_PLAY, ITEM_PREV, ITEM_REPEAT,
     ITEM_SHUFFLE,
 };
 
@@ -57,6 +57,7 @@ pub enum Hit {
     Next,
     Shuffle,
     Repeat,
+    Output,
     Title,
     Seek,
 }
@@ -80,7 +81,7 @@ pub struct LayoutParams {
     /// The player supports shuffle or repeat, so those buttons can show.
     pub extra: bool,
     /// The shown items left to right (`config::ITEM_*`), zero-padded.
-    pub order: [u8; 8],
+    pub order: [u8; ITEM_COUNT],
     /// 0 small, 1 medium, 2 large.
     pub button_size: u32,
     /// 0 thin, 1 normal, 2 thick.
@@ -110,6 +111,8 @@ pub struct Layout {
     pub buttons: [Rect; 3],
     /// Shuffle and repeat; zero-sized when not shown.
     pub extras: [Rect; 2],
+    /// The output device button; zero-sized when not shown.
+    pub output: Rect,
     pub row1: Rect,
     pub row2: Rect,
     pub elapsed: Rect,
@@ -170,6 +173,11 @@ impl Layout {
                 }
                 ITEM_SHUFFLE | ITEM_REPEAT => {
                     l.extras[usize::from(item == ITEM_REPEAT)] = Rect { x, y: by, w: ew, h: bh };
+                    x += ew;
+                    end_pad = (6.0 * u).round();
+                }
+                ITEM_OUTPUT => {
+                    l.output = Rect { x, y: by, w: ew, h: bh };
                     x += ew;
                     end_pad = (6.0 * u).round();
                 }
@@ -249,6 +257,9 @@ impl Layout {
                 return [Hit::Shuffle, Hit::Repeat][i];
             }
         }
+        if within(&self.output, 0.0) {
+            return Hit::Output;
+        }
         if within(&self.row1, 0.0) && y < self.row2.y - 3.0 * self.u {
             return Hit::Title;
         }
@@ -314,6 +325,8 @@ pub struct Frame {
     pub notice: Option<String>,
     /// Mark the settings gear: a newer version is available.
     pub update: bool,
+    /// The current output is headphones (changes the output button's icon).
+    pub headphones: bool,
 }
 
 /// A widget's album art, decoded and scaled to the size it is drawn at.
@@ -691,6 +704,50 @@ unsafe fn draw(
             }
             GdipDeleteBrush(brush);
         }
+    }
+
+    // ---- output device ----------------------------------------------------
+    if l.output.w > 0.0 {
+        let b = l.output;
+        let u = u * l.b;
+        if f.hover == Hit::Output {
+            let c = if f.pressed == Hit::Output { plate_down } else { plate };
+            fill_round_color(g, c, b, radius);
+        }
+        let color = if f.hover == Hit::Output { primary } else { dim };
+        let (cx, cy) = (b.cx(), b.cy());
+        let brush = solid(color);
+        let mut pen: *mut GpPen = null_mut();
+        GdipCreatePen1(color, 1.5 * u, UnitPixel, &mut pen);
+        if !pen.is_null() {
+            GdipSetPenLineCap197819(pen, LineCapRound, LineCapRound, DashCapRound);
+            if f.headphones {
+                // A band over the top with an ear cup on each side.
+                GdipDrawArc(g, pen, cx - 5.5 * u, cy - 6.0 * u, 11.0 * u, 11.0 * u, 180.0, 180.0);
+                for side in [-1.0f32, 1.0] {
+                    let cup = Rect { x: cx + side * 5.0 * u - 1.6 * u, y: cy - 0.8 * u, w: 3.2 * u, h: 6.0 * u };
+                    fill_round(g, brush, cup, 1.4 * u);
+                }
+            } else {
+                // A speaker cone with two sound waves.
+                GdipFillRectangle(g, brush, cx - 6.5 * u, cy - 2.2 * u, 3.0 * u, 4.4 * u);
+                polygon(
+                    g,
+                    brush,
+                    &[
+                        (cx - 4.0 * u, cy - 2.2 * u),
+                        (cx - 0.5 * u, cy - 5.5 * u),
+                        (cx - 0.5 * u, cy + 5.5 * u),
+                        (cx - 4.0 * u, cy + 2.2 * u),
+                    ],
+                );
+                for r in [3.0 * u, 5.8 * u] {
+                    GdipDrawArc(g, pen, cx + 0.6 * u - r, cy - r, r * 2.0, r * 2.0, -42.0, 84.0);
+                }
+            }
+            GdipDeletePen(pen);
+        }
+        GdipDeleteBrush(brush);
     }
 
     // ---- text and seek bar -------------------------------------------------

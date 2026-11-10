@@ -28,6 +28,8 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 - Mouse wheel over the widget changes the player's own volume
 - Click the title to copy "Artist - Title"
 - With several players running, right-click and choose one under Player
+- Right-click and choose under Output device to switch speakers / headphones,
+  or add the output button to the widget in Settings, Layout
 - Shift + mouse wheel over a widget nudges it left or right
 
 ## Settings
@@ -41,12 +43,19 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 - **Appearance**: text size, font, text color, rendering (smooth or sharp),
   highlight color, album art shape, seek bar thickness, background, times,
   scrolling titles
-- **Behavior**: what the mouse wheel, a click on the album art, and a click
-  on the title do
+- **Behavior**: what the mouse wheel, a click on the album art, a click on
+  the title, and the output device button do
 
 Requires Windows 10 (1809 or later) or Windows 11, 64-bit, with the taskbar at
 the bottom or top of the screen. Taskbars on other displays exist only when
 "Show my taskbar on all displays" is on in Windows taskbar settings.
+
+## Switching output devices
+
+Windows has no official way for an app to change the default output device.
+Like other switchers, this uses an undocumented Windows interface that has
+been stable since Windows 7. If a Windows update ever changes it, switching
+shows "Could not switch output" and everything else keeps working.
 
 ## Update check
 

@@ -45,6 +45,9 @@ const ID_SEEK_SIZE: i32 = 132;
 const ID_BACKGROUND: i32 = 133;
 const ID_ART_CLICK: i32 = 134;
 const ID_TITLE_CLICK: i32 = 135;
+const ID_OUTPUT_CLICK: i32 = 136;
+const ID_OUTPUT_A: i32 = 137;
+const ID_OUTPUT_B: i32 = 138;
 // Buttons.
 const ID_RESET_POS: i32 = 120;
 const ID_CLOSE: i32 = 121;
@@ -95,6 +98,9 @@ static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 thread_local! {
     /// Device names behind the per-display entries of the "Show on" list.
     static DISPLAYS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Device ids behind the rows of the two output-device lists (row 0 is
+    /// "not set").
+    static OUTPUTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     /// Every tab's controls, as (tab index, window handle).
     static PAGES: RefCell<Vec<(usize, isize)>> = const { RefCell::new(Vec::new()) };
 }
@@ -443,15 +449,15 @@ pub fn open(module: HINSTANCE) {
             16,
             y,
             214,
-            154,
+            166,
             ID_ITEMS,
             b.font,
         );
         b.button("Move up", 242, y, 142, ID_ITEM_UP, false);
         b.button("Move down", 242, y + 32, 142, ID_ITEM_DOWN, false);
         b.button("Show / hide", 242, y + 72, 142, ID_ITEM_TOGGLE, false);
-        b.button("Reset layout", 242, y + 126, 142, ID_ITEM_RESET, false);
-        y += 162;
+        b.button("Reset layout", 242, y + 138, 142, ID_ITEM_RESET, false);
+        y += 174;
         b.text(
             "Shuffle and repeat only appear with players that support them. With the \
              settings button hidden, right-click the widget to get back here.",
@@ -545,6 +551,32 @@ pub fn open(module: HINSTANCE) {
             cfg.title_click,
         );
 
+        y += 44;
+        b.header("Output device button", y);
+        y += 24;
+        b.text(
+            "Turn the button on in the Layout tab. Right-clicking it always lists the              devices.",
+            y,
+            36,
+        );
+        y += 42;
+        b.choice(
+            "Click the button",
+            y,
+            ID_OUTPUT_CLICK,
+            &["List the devices", "Switch between two devices"],
+            cfg.output_click,
+        );
+        let outputs = crate::devices::list();
+        let mut names: Vec<String> = vec!["(not set)".into()];
+        names.extend(outputs.iter().map(|d| d.name.clone()));
+        let row_of = |id: &str| outputs.iter().position(|d| d.id == id).map_or(0, |i| i + 1);
+        y += 30;
+        b.choice_owned("First device", y, ID_OUTPUT_A, &names, row_of(&cfg.output_a));
+        y += 30;
+        b.choice_owned("Second device", y, ID_OUTPUT_B, &names, row_of(&cfg.output_b));
+        OUTPUTS.with(|v| *v.borrow_mut() = outputs.into_iter().map(|d| d.id).collect());
+
         // ---- Buttons ----------------------------------------------------
         b.tab.set(NO_TAB);
         b.button("Exit Taskbar Media", 16, BUTTONS_Y, 150, ID_EXIT, false);
@@ -626,6 +658,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             ID_BACKGROUND => Some(|c| &mut c.background),
             ID_ART_CLICK => Some(|c| &mut c.art_click),
             ID_TITLE_CLICK => Some(|c| &mut c.title_click),
+            ID_OUTPUT_CLICK => Some(|c| &mut c.output_click),
             _ => None,
         };
         if let Some(field) = field {
@@ -682,6 +715,22 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
                     c.display_name = name;
                 }
                 _ => c.display_mode = DISPLAY_MAIN,
+            });
+        }
+        (ID_OUTPUT_A | ID_OUTPUT_B, CBN_SELCHANGE) => {
+            // Row 0 is "(not set)".
+            let row = selection(hwnd, id);
+            let device = if row == 0 {
+                String::new()
+            } else {
+                OUTPUTS.with(|v| v.borrow().get(row - 1).cloned()).unwrap_or_default()
+            };
+            crate::update_config(|c| {
+                if id == ID_OUTPUT_A {
+                    c.output_a = device;
+                } else {
+                    c.output_b = device;
+                }
             });
         }
         (ID_ITEM_UP, BN_CLICKED) => edit_layout(hwnd, |layout, row| {
