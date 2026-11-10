@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.5.0
+
+### Added
+- Player switcher: up and down arrows just left of the album art that step
+  through the apps currently playing. They only appear when more than one
+  player is running, and the widget briefly names the player you switch to.
+
+### Changed
+- The settings button is now hidden by default to make room; settings are
+  on the right-click menu and the tray icon. It can be shown again in
+  Settings, Layout. Existing layouts are updated the same way once.
+- With the settings button hidden, an available update is marked with a dot
+  on the corner of the album art.
+
 ## 1.4.1
 
 ### Fixed

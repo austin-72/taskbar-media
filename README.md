@@ -15,7 +15,7 @@ Nearly everything can be rearranged, hidden or restyled:
 
 From left to right:
 
-- A small settings button
+- Up / down arrows to switch player, when more than one app is playing
 - Album art; click it to bring up the app that is playing
 - Shuffle, previous, play/pause, next, repeat (shuffle and repeat only when
   the player supports them)
@@ -32,10 +32,12 @@ app area is narrowed to make room for it, and on Windows 11 the widget shrinks.
 
 Run `TaskbarMedia.exe`. There is no installer and no other files.
 
-- Click the gear, right-click the widget, or use the tray icon for settings
+- Right-click the widget or use the tray icon for settings (a settings
+  button can be added to the widget in Settings, Layout)
 - Mouse wheel over the widget changes the player's own volume
 - Click the title to copy "Artist - Title"
-- With several players running, right-click and choose one under Player
+- With several players running, use the arrows left of the album art, or
+  right-click and choose one under Player ("Automatic" hands the choice back)
 - Right-click and choose under Output device to switch speakers / headphones,
   or add the output button to the widget in Settings, Layout
 - Shift + mouse wheel over a widget nudges it left or right

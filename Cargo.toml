@@ -2,7 +2,7 @@
 name = "taskbar-media"
 license = "MIT"
 description = "Now-playing widget for the Windows taskbar"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 
 [[bin]]

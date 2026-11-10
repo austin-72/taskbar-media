@@ -102,11 +102,13 @@ pub const ITEM_INFO: u8 = 8;
 pub const ITEM_OUTPUT: u8 = 9;
 pub const ITEM_TITLE: u8 = 10;
 pub const ITEM_SEEK: u8 = 11;
+pub const ITEM_PLAYERS: u8 = 12;
 /// How many items there are.
-pub const ITEM_COUNT: usize = 11;
+pub const ITEM_COUNT: usize = 12;
 
 /// (item, name in the registry, name in the settings window), default order.
 pub const ITEMS: [(u8, &str, &str); ITEM_COUNT] = [
+    (ITEM_PLAYERS, "players", "Player switcher (up / down)"),
     (ITEM_GEAR, "gear", "Settings button"),
     (ITEM_ART, "art", "Album art"),
     (ITEM_SHUFFLE, "shuffle", "Shuffle"),
@@ -122,7 +124,8 @@ pub const ITEMS: [(u8, &str, &str); ITEM_COUNT] = [
 
 /// Items that are hidden unless the user turns them on.
 fn hidden_by_default(item: u8) -> bool {
-    matches!(item, ITEM_OUTPUT | ITEM_TITLE | ITEM_SEEK)
+    // Settings are always a right-click away, so the gear is opt-in.
+    matches!(item, ITEM_GEAR | ITEM_OUTPUT | ITEM_TITLE | ITEM_SEEK)
 }
 
 /// Font choices; the first is the default.
@@ -158,6 +161,15 @@ fn parse_layout(text: &str) -> Vec<(u8, bool)> {
             if !layout.iter().any(|(i, _)| i == item) {
                 layout.push((*item, shown));
             }
+        }
+    }
+    // Layouts saved before the player switcher existed: it takes the
+    // settings button's place, just left of the album art.
+    if !layout.iter().any(|(i, _)| *i == ITEM_PLAYERS) {
+        let at = layout.iter().position(|(i, _)| *i == ITEM_ART).unwrap_or(0);
+        layout.insert(at, (ITEM_PLAYERS, true));
+        if let Some(gear) = layout.iter_mut().find(|(i, _)| *i == ITEM_GEAR) {
+            gear.1 = false;
         }
     }
     for (item, _, _) in ITEMS {

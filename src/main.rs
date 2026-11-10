@@ -703,6 +703,7 @@ impl App {
                 show_times: self.cfg.show_times,
                 mini: false,
                 extra: self.snap.can_shuffle || self.snap.can_repeat,
+                players: self.snap.sessions.len() > 1,
                 order: self.cfg.order(tb.primary),
                 button_size: self.cfg.button_size,
                 seek_size: self.cfg.seek_size,
@@ -1091,6 +1092,22 @@ impl App {
             if hit == self.widgets[i].pressed {
                 match hit {
                     Hit::Gear => action = Action::Settings,
+                    Hit::PlayerUp | Hit::PlayerDown => {
+                        // Step through the players, wrapping at the ends.
+                        let ids = &self.snap.sessions;
+                        if ids.len() > 1 {
+                            let at = ids.iter().position(|id| *id == self.snap.app_id).unwrap_or(0);
+                            let next = if hit == Hit::PlayerDown {
+                                (at + 1) % ids.len()
+                            } else {
+                                (at + ids.len() - 1) % ids.len()
+                            };
+                            let name = launch::display_name(&ids[next]);
+                            media::set_preferred(Some(ids[next].clone()));
+                            let _ = self.tx.send(Cmd::Refresh);
+                            self.notice = Some((name, Instant::now()));
+                        }
+                    }
                     Hit::Output => {
                         let both = !self.cfg.output_a.is_empty() && !self.cfg.output_b.is_empty();
                         action = if self.cfg.output_click == 1 && both {

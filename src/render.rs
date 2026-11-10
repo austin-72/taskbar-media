@@ -19,7 +19,7 @@ use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
 use crate::config::{
-    FONTS, ITEM_COUNT, ITEM_OUTPUT, ITEM_SEEK, ITEM_TITLE, ITEM_ART, ITEM_GEAR, ITEM_INFO, ITEM_NEXT, ITEM_PLAY, ITEM_PREV, ITEM_REPEAT,
+    FONTS, ITEM_COUNT, ITEM_OUTPUT, ITEM_PLAYERS, ITEM_SEEK, ITEM_TITLE, ITEM_ART, ITEM_GEAR, ITEM_INFO, ITEM_NEXT, ITEM_PLAY, ITEM_PREV, ITEM_REPEAT,
     ITEM_SHUFFLE,
 };
 
@@ -58,6 +58,8 @@ pub enum Hit {
     Shuffle,
     Repeat,
     Output,
+    PlayerUp,
+    PlayerDown,
     Title,
     Seek,
 }
@@ -80,6 +82,8 @@ pub struct LayoutParams {
     pub mini: bool,
     /// The player supports shuffle or repeat, so those buttons can show.
     pub extra: bool,
+    /// More than one player is running, so the switcher can show.
+    pub players: bool,
     /// The shown items left to right (`config::ITEM_*`), zero-padded.
     pub order: [u8; ITEM_COUNT],
     /// 0 small, 1 medium, 2 large.
@@ -113,6 +117,9 @@ pub struct Layout {
     pub extras: [Rect; 2],
     /// The output device button; zero-sized when not shown.
     pub output: Rect,
+    /// The player switcher: an up arrow above a down arrow. Zero-sized when
+    /// not shown.
+    pub players: Rect,
     /// The title sits above the seek bar, rather than each on its own.
     pub stacked: bool,
     pub row1: Rect,
@@ -150,13 +157,17 @@ impl Layout {
             .filter(|item| match *item {
                 0 => false,
                 ITEM_SHUFFLE | ITEM_REPEAT => p.extra && !p.mini,
+                ITEM_PLAYERS => p.players,
                 ITEM_INFO => !p.mini,
                 // The stacked block already has both; don't show them twice.
                 ITEM_TITLE | ITEM_SEEK => !p.mini && !p.order.contains(&ITEM_INFO),
                 _ => true,
             })
             .collect();
-        let mut x = if items.first() == Some(&ITEM_GEAR) { (3.0 * u).round() } else { (6.0 * u).round() };
+        let mut x = match items.first() {
+            Some(&ITEM_GEAR) | Some(&ITEM_PLAYERS) => (3.0 * u).round(),
+            _ => (6.0 * u).round(),
+        };
         let mut end_pad = 0.0;
         for item in items {
             end_pad = 0.0;
@@ -165,6 +176,12 @@ impl Layout {
                 ITEM_GEAR => {
                     l.gear = Rect { x, y: art_y, w: gear_size, h: gear_size };
                     x += gear_size + (3.0 * u).round();
+                }
+                // A narrow column as tall as the art.
+                ITEM_PLAYERS => {
+                    let w = (14.0 * u).round();
+                    l.players = Rect { x, y: art_y, w, h: art_size };
+                    x += w + (3.0 * u).round();
                 }
                 ITEM_ART => {
                     l.art = Rect { x, y: art_y, w: art_size, h: art_size };
@@ -251,6 +268,11 @@ impl Layout {
         // Generous target around the little gear.
         if within(&self.gear, 3.0 * self.u) {
             return if y < self.gear.y + self.gear.h + 4.0 * self.u { Hit::Gear } else { Hit::None };
+        }
+        // The switcher: top half is up, bottom half is down.
+        if within(&self.players, 2.0 * self.u) {
+            let middle = self.players.y + self.players.h / 2.0;
+            return if y < middle { Hit::PlayerUp } else { Hit::PlayerDown };
         }
         // Art and buttons can be clicked over the full height of the taskbar.
         if within(&self.art, 2.0 * self.u) {
@@ -690,6 +712,32 @@ unsafe fn draw(
     }
     }
 
+    // ---- player switcher ----------------------------------------------------
+    if l.players.w > 0.0 {
+        let b = l.players;
+        let half = b.h / 2.0;
+        for (kind, top, dir) in [(Hit::PlayerUp, b.y, -1.0f32), (Hit::PlayerDown, b.y + half, 1.0)] {
+            let zone = Rect { x: b.x - u, y: top, w: b.w + 2.0 * u, h: half };
+            if f.hover == kind {
+                let c = if f.pressed == kind { plate_down } else { plate };
+                fill_round_color(g, c, zone, 3.0 * u);
+            }
+            // A small triangle pointing up or down.
+            let brush = solid(if f.hover == kind { primary } else { dim });
+            let (cx, cy) = (zone.cx(), zone.cy());
+            polygon(
+                g,
+                brush,
+                &[
+                    (cx - 4.0 * u, cy - dir * 2.4 * u),
+                    (cx + 4.0 * u, cy - dir * 2.4 * u),
+                    (cx, cy + dir * 2.6 * u),
+                ],
+            );
+            GdipDeleteBrush(brush);
+        }
+    }
+
     // ---- album art -------------------------------------------------------
     // The art is decoded even when hidden: the highlight color comes from it.
     let size = if l.art.w > 0.0 { l.art.w as i32 } else { (40.0 * u) as i32 };
@@ -732,6 +780,15 @@ unsafe fn draw(
     } else if f.hover == Hit::Art {
         fill_round_color(g, 0x30FF_FFFF, l.art, art_radius);
     }
+    }
+
+    // With the settings button hidden, an available update is marked on the
+    // corner of the album art instead.
+    if f.update && l.gear.w <= 0.0 && l.art.w > 0.0 {
+        let r = 2.4 * u;
+        let brush = solid(0xFF4C_C2FF);
+        GdipFillEllipse(g, brush, l.art.x - r * 0.6, l.art.y - r * 0.6, r * 2.0, r * 2.0);
+        GdipDeleteBrush(brush);
     }
 
     // ---- transport buttons -------------------------------------------------
