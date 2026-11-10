@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0
+
+### Added
+- Layout editor: choose which items show (settings button, album art,
+  shuffle, previous, play/pause, next, repeat, title and seek bar) and put
+  them in any order.
+- Button size: small, medium or large.
+- Text options: "Title · Artist", title only, or "Artist · Title" over the
+  seek bar, or title over artist or album with no seek bar.
+- Font choice.
+- Highlight color: from the album art, the Windows accent color, or none.
+- Album art shape: rounded, square or circle.
+- Seek bar thickness.
+- Optional subtle or solid background behind the widget.
+- Click actions: choose what clicking the album art and the title does.
+
+### Changed
+- The settings window now has tabs: General, Layout, Appearance, Behavior.
+
 ## 1.1.0
 
 ### Added

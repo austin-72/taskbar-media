@@ -32,22 +32,17 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 
 ## Settings
 
-<img src="docs/settings.png" alt="The settings window" width="436">
+<img src="docs/settings.png" alt="The settings window" width="456">
 
-- **Start with Windows**
-- **Hide while paused**
-- **Tray icon** on or off
-- **Mouse wheel**: player volume, system volume, or nothing
-- **Check GitHub for new versions**
-- **Show media from**: any app, or Spotify only
-- **Show on**: the main taskbar, all taskbars, or one chosen display
-- **Text size**, **width**, **text color**
-- **Rendering**: smooth (drawn at 2-3x and scaled down) or sharp (pixel-snapped)
-- **Keep the widget clear of app icons**
-- **Show elapsed and total time**
-- **Scroll long titles**
-- **Color the seek bar from the album art**
-- **Shuffle and repeat buttons**, **click the title to copy**
+- **General**: start with Windows, hide while paused, tray icon, update
+  check, Spotify only, which taskbars to show on, keep clear of app icons
+- **Layout**: which items show and in what order, text width, button size,
+  and what the text shows
+- **Appearance**: text size, font, text color, rendering (smooth or sharp),
+  highlight color, album art shape, seek bar thickness, background, times,
+  scrolling titles
+- **Behavior**: what the mouse wheel, a click on the album art, and a click
+  on the title do
 
 Requires Windows 10 (1809 or later) or Windows 11, 64-bit, with the taskbar at
 the bottom or top of the screen. Taskbars on other displays exist only when

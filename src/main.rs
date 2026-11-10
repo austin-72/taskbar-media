@@ -156,6 +156,8 @@ struct App {
     cfg: Config,
     widgets: Vec<Widget>,
     system_light: bool,
+    /// The Windows accent color, 0xAARRGGBB.
+    system_accent: u32,
     ticks: u32,
     seek_override: Option<SeekOverride>,
     /// Volume level to show for a moment after the wheel changed it.
@@ -376,6 +378,12 @@ impl Widget {
 }
 
 impl App {
+    /// Whether the seek bar is on screen: the player reports a timeline and
+    /// the chosen text layout has a seek bar row.
+    fn seek_shown(&self) -> bool {
+        self.has_timeline() && self.cfg.text_layout < 3
+    }
+
     fn has_timeline(&self) -> bool {
         self.snap.end > self.snap.start
     }
@@ -524,6 +532,7 @@ impl App {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks % 10 == 1 {
             self.system_light = config::system_light_theme();
+            self.system_accent = config::system_accent().unwrap_or(0xFF4C_C2FF);
         }
         if self.seek_override.as_ref().is_some_and(|o| o.at.elapsed() > Duration::from_secs(3)) {
             self.seek_override = None;
@@ -604,7 +613,10 @@ impl App {
                 width: self.cfg.width,
                 show_times: self.cfg.show_times,
                 mini: false,
-                extra: self.cfg.extra_buttons && (self.snap.can_shuffle || self.snap.can_repeat),
+                extra: self.snap.can_shuffle || self.snap.can_repeat,
+                order: self.cfg.order(),
+                button_size: self.cfg.button_size,
+                seek_size: self.cfg.seek_size,
             };
             let mut params = base;
             let mut layout = Layout::new(&params);
@@ -691,8 +703,23 @@ impl App {
         if w <= 0 || h <= 0 || !self.snap.active {
             return;
         }
-        let has_timeline = self.has_timeline();
+        let has_timeline = self.seek_shown();
         let duration = (self.snap.end - self.snap.start).max(1);
+
+        // Which text goes where, per the chosen text layout.
+        let (title, artist, album) = (&self.snap.title, &self.snap.artist, &self.snap.album);
+        let (line1, inline, below) = match self.cfg.text_layout {
+            1 => (title.clone(), String::new(), artist.clone()),
+            2 if !artist.is_empty() => (artist.clone(), title.clone(), String::new()),
+            2 => (title.clone(), String::new(), String::new()),
+            3 => (title.clone(), String::new(), artist.clone()),
+            4 if !album.is_empty() => (title.clone(), String::new(), album.clone()),
+            4 => (title.clone(), String::new(), artist.clone()),
+            // "Title · Artist" needs the seek bar row; without one the
+            // artist drops to the second row.
+            _ if has_timeline => (title.clone(), artist.clone(), String::new()),
+            _ => (title.clone(), String::new(), artist.clone()),
+        };
 
         // Title scrolling: restart the cycle whenever the text changes.
         let scroll = self.cfg.scroll_titles && !self.widgets[i].params.mini;
@@ -728,8 +755,9 @@ impl App {
             params: widget.params,
             smooth: self.cfg.smooth,
             light: !self.light_text_on_dark(),
-            title: self.snap.title.clone(),
-            artist: self.snap.artist.clone(),
+            title: line1,
+            artist: inline,
+            below,
             art_gen: self.snap.art_gen,
             has_art: self.snap.art.is_some(),
             playing: self.snap.playing,
@@ -750,7 +778,11 @@ impl App {
             shuffle: self.snap.shuffle,
             can_repeat: self.snap.can_repeat,
             repeat: self.snap.repeat,
-            accent: self.cfg.accent,
+            accent: self.cfg.accent_mode,
+            accent_rgb: self.system_accent,
+            art_shape: self.cfg.art_shape,
+            background: self.cfg.background,
+            font: self.cfg.font,
             volume: self.volume_flash.as_ref().map(|(level, _)| *level),
             notice: self.notice.as_ref().map(|(text, _)| text.clone()),
             update: update::available().is_some(),
@@ -772,7 +804,7 @@ impl App {
     }
 
     fn hit(&self, i: usize, x: i32, y: i32) -> Hit {
-        self.widgets[i].layout.hit(x as f32, y as f32, self.has_timeline())
+        self.widgets[i].layout.hit(x as f32, y as f32, self.seek_shown())
     }
 
     fn mouse_move(&mut self, i: usize, x: i32, y: i32) {
@@ -847,7 +879,16 @@ impl App {
             if hit == self.widgets[i].pressed {
                 match hit {
                     Hit::Gear => action = Action::Settings,
-                    Hit::Art => action = Action::Open(self.snap.app_id.clone()),
+                    Hit::Art => match self.cfg.art_click {
+                        0 => action = Action::Open(self.snap.app_id.clone()),
+                        1 if self.snap.can_toggle => {
+                            let _ = self.tx.send(Cmd::Toggle);
+                        }
+                        _ => {}
+                    },
+                    Hit::Title if self.cfg.title_click == 1 => {
+                        action = Action::Open(self.snap.app_id.clone());
+                    }
                     Hit::Prev if self.snap.can_prev => {
                         let _ = self.tx.send(Cmd::Prev);
                     }
@@ -869,7 +910,7 @@ impl App {
                         };
                         let _ = self.tx.send(Cmd::Repeat(next));
                     }
-                    Hit::Title if self.cfg.click_copy && !self.snap.title.is_empty() => {
+                    Hit::Title if self.cfg.title_click == 0 && !self.snap.title.is_empty() => {
                         let text = if self.snap.artist.is_empty() {
                             self.snap.title.clone()
                         } else {
@@ -1225,6 +1266,7 @@ fn main() {
                 cfg,
                 widgets: Vec::new(),
                 system_light: false,
+                system_accent: 0xFF4C_C2FF,
                 ticks: 0,
                 seek_override: None,
                 volume_flash: None,

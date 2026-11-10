@@ -41,12 +41,29 @@ pub struct Config {
     /// Mouse wheel over the widget: 0 nothing, 1 system volume, 2 the
     /// player's own volume.
     pub wheel_mode: u32,
-    /// Shuffle and repeat buttons, for players that support them.
-    pub extra_buttons: bool,
-    /// Take the seek bar's color from the album art.
-    pub accent: bool,
-    /// Clicking the title copies "Artist - Title".
-    pub click_copy: bool,
+    /// Every widget item, left to right, with whether it is shown.
+    pub layout: Vec<(u8, bool)>,
+    /// 0 small, 1 medium, 2 large.
+    pub button_size: u32,
+    /// 0 "Title · Artist" over the seek bar, 1 title over the seek bar,
+    /// 2 "Artist · Title" over the seek bar, 3 title over artist,
+    /// 4 title over album.
+    pub text_layout: u32,
+    /// Index into `FONTS`.
+    pub font: u32,
+    /// Highlight color: 0 from the album art, 1 the Windows accent color,
+    /// 2 none (same as the text).
+    pub accent_mode: u32,
+    /// 0 rounded, 1 square, 2 circle.
+    pub art_shape: u32,
+    /// 0 thin, 1 normal, 2 thick.
+    pub seek_size: u32,
+    /// 0 none, 1 subtle, 2 solid.
+    pub background: u32,
+    /// Clicking the album art: 0 opens the player, 1 play/pause, 2 nothing.
+    pub art_click: u32,
+    /// Clicking the title: 0 copies it, 1 opens the player, 2 nothing.
+    pub title_click: u32,
     pub check_updates: bool,
     /// Keep clear of app buttons: reserve space (Windows 10) or shrink (11).
     pub avoid_apps: bool,
@@ -56,7 +73,98 @@ pub struct Config {
     pub offset2: i32,
 }
 
+/// The widget's items. The numbers are stored in layouts; never renumber.
+pub const ITEM_GEAR: u8 = 1;
+pub const ITEM_ART: u8 = 2;
+pub const ITEM_SHUFFLE: u8 = 3;
+pub const ITEM_PREV: u8 = 4;
+pub const ITEM_PLAY: u8 = 5;
+pub const ITEM_NEXT: u8 = 6;
+pub const ITEM_REPEAT: u8 = 7;
+pub const ITEM_INFO: u8 = 8;
+
+/// (item, name in the registry, name in the settings window), default order.
+pub const ITEMS: [(u8, &str, &str); 8] = [
+    (ITEM_GEAR, "gear", "Settings button"),
+    (ITEM_ART, "art", "Album art"),
+    (ITEM_SHUFFLE, "shuffle", "Shuffle"),
+    (ITEM_PREV, "prev", "Previous"),
+    (ITEM_PLAY, "play", "Play / pause"),
+    (ITEM_NEXT, "next", "Next"),
+    (ITEM_REPEAT, "repeat", "Repeat"),
+    (ITEM_INFO, "info", "Title and seek bar"),
+];
+
+/// Font choices; the first is the default.
+pub const FONTS: [&str; 7] =
+    ["Segoe UI", "Bahnschrift", "Calibri", "Verdana", "Tahoma", "Georgia", "Consolas"];
+
+pub fn item_label(item: u8) -> &'static str {
+    ITEMS.iter().find(|(i, _, _)| *i == item).map(|(_, _, label)| *label).unwrap_or("")
+}
+
+pub fn default_layout(shuffle_and_repeat: bool) -> Vec<(u8, bool)> {
+    ITEMS
+        .iter()
+        .map(|(item, _, _)| {
+            (*item, shuffle_and_repeat || (*item != ITEM_SHUFFLE && *item != ITEM_REPEAT))
+        })
+        .collect()
+}
+
+/// "gear,art,-shuffle,..." (a leading '-' means hidden). Unknown names are
+/// dropped and missing items are added at the end, so the result always has
+/// every item exactly once.
+fn parse_layout(text: &str) -> Vec<(u8, bool)> {
+    let mut layout: Vec<(u8, bool)> = Vec::new();
+    for part in text.split(',') {
+        let part = part.trim();
+        let (name, shown) = match part.strip_prefix('-') {
+            Some(name) => (name, false),
+            None => (part, true),
+        };
+        if let Some((item, _, _)) = ITEMS.iter().find(|(_, key, _)| *key == name) {
+            if !layout.iter().any(|(i, _)| i == item) {
+                layout.push((*item, shown));
+            }
+        }
+    }
+    for (item, _, _) in ITEMS {
+        if !layout.iter().any(|(i, _)| *i == item) {
+            layout.push((item, true));
+        }
+    }
+    layout
+}
+
+fn format_layout(layout: &[(u8, bool)]) -> String {
+    layout
+        .iter()
+        .filter_map(|(item, shown)| {
+            let (_, key, _) = ITEMS.iter().find(|(i, _, _)| i == item)?;
+            Some(if *shown { key.to_string() } else { format!("-{key}") })
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The Windows accent color as 0xAARRGGBB, if one is set.
+pub fn system_accent() -> Option<u32> {
+    // Stored as 0xAABBGGRR.
+    let c = read_dword(w!("Software\\Microsoft\\Windows\\DWM"), w!("AccentColor"))?;
+    Some(0xFF00_0000 | ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF))
+}
+
 impl Config {
+    /// The shown items, left to right, zero-padded.
+    pub fn order(&self) -> [u8; 8] {
+        let mut order = [0u8; 8];
+        for (slot, (item, _)) in order.iter_mut().zip(self.layout.iter().filter(|(_, shown)| *shown)) {
+            *slot = *item;
+        }
+        order
+    }
+
     pub fn load() -> Self {
         let d = |name: PCWSTR, default: u32, max: u32| {
             read_dword(SETTINGS_KEY, name).filter(|v| *v <= max).unwrap_or(default)
@@ -79,9 +187,25 @@ impl Config {
             wheel_mode: read_dword(SETTINGS_KEY, w!("WheelMode")).filter(|v| *v <= 2).unwrap_or(
                 if read_dword(SETTINGS_KEY, w!("WheelVolume")) == Some(0) { 0 } else { 2 },
             ),
-            extra_buttons: d(w!("ExtraButtons"), 1, 1) == 1,
-            accent: d(w!("Accent"), 1, 1) == 1,
-            click_copy: d(w!("ClickCopy"), 1, 1) == 1,
+            layout: match read_string(SETTINGS_KEY, w!("Layout")) {
+                Some(text) => parse_layout(&text),
+                // 1.1 had a single switch for the shuffle and repeat buttons.
+                None => default_layout(read_dword(SETTINGS_KEY, w!("ExtraButtons")) != Some(0)),
+            },
+            button_size: d(w!("ButtonSize"), 1, 2),
+            text_layout: d(w!("TextLayout"), 0, 4),
+            font: d(w!("Font"), 0, FONTS.len() as u32 - 1),
+            // 1.1 stored these three as on/off switches.
+            accent_mode: read_dword(SETTINGS_KEY, w!("AccentMode")).filter(|v| *v <= 2).unwrap_or(
+                if read_dword(SETTINGS_KEY, w!("Accent")) == Some(0) { 2 } else { 0 },
+            ),
+            art_shape: d(w!("ArtShape"), 0, 2),
+            seek_size: d(w!("SeekSize"), 1, 2),
+            background: d(w!("Background"), 0, 2),
+            art_click: d(w!("ArtClick"), 0, 2),
+            title_click: read_dword(SETTINGS_KEY, w!("TitleClick")).filter(|v| *v <= 2).unwrap_or(
+                if read_dword(SETTINGS_KEY, w!("ClickCopy")) == Some(0) { 2 } else { 0 },
+            ),
             check_updates: d(w!("CheckUpdates"), 1, 1) == 1,
             avoid_apps: d(w!("AvoidApps"), 1, 1) == 1,
             tray_icon: d(w!("TrayIcon"), 1, 1) == 1,
@@ -102,9 +226,16 @@ impl Config {
         write_dword(SETTINGS_KEY, w!("SpotifyOnly"), self.spotify_only as u32);
         write_dword(SETTINGS_KEY, w!("ScrollTitles"), self.scroll_titles as u32);
         write_dword(SETTINGS_KEY, w!("WheelMode"), self.wheel_mode);
-        write_dword(SETTINGS_KEY, w!("ExtraButtons"), self.extra_buttons as u32);
-        write_dword(SETTINGS_KEY, w!("Accent"), self.accent as u32);
-        write_dword(SETTINGS_KEY, w!("ClickCopy"), self.click_copy as u32);
+        write_string(SETTINGS_KEY, w!("Layout"), &format_layout(&self.layout));
+        write_dword(SETTINGS_KEY, w!("ButtonSize"), self.button_size);
+        write_dword(SETTINGS_KEY, w!("TextLayout"), self.text_layout);
+        write_dword(SETTINGS_KEY, w!("Font"), self.font);
+        write_dword(SETTINGS_KEY, w!("AccentMode"), self.accent_mode);
+        write_dword(SETTINGS_KEY, w!("ArtShape"), self.art_shape);
+        write_dword(SETTINGS_KEY, w!("SeekSize"), self.seek_size);
+        write_dword(SETTINGS_KEY, w!("Background"), self.background);
+        write_dword(SETTINGS_KEY, w!("ArtClick"), self.art_click);
+        write_dword(SETTINGS_KEY, w!("TitleClick"), self.title_click);
         write_dword(SETTINGS_KEY, w!("CheckUpdates"), self.check_updates as u32);
         write_dword(SETTINGS_KEY, w!("AvoidApps"), self.avoid_apps as u32);
         write_dword(SETTINGS_KEY, w!("TrayIcon"), self.tray_icon as u32);

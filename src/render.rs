@@ -8,7 +8,7 @@
 
 use std::ptr::null_mut;
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
@@ -17,6 +17,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Graphics::GdiPlus::*;
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
+
+use crate::config::{
+    FONTS, ITEM_ART, ITEM_GEAR, ITEM_INFO, ITEM_NEXT, ITEM_PLAY, ITEM_PREV, ITEM_REPEAT,
+    ITEM_SHUFFLE,
+};
 
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct Rect {
@@ -72,8 +77,14 @@ pub struct LayoutParams {
     pub show_times: bool,
     /// Art and buttons only, for when there is no room for the text.
     pub mini: bool,
-    /// Shuffle and repeat buttons after the transport buttons.
+    /// The player supports shuffle or repeat, so those buttons can show.
     pub extra: bool,
+    /// The shown items left to right (`config::ITEM_*`), zero-padded.
+    pub order: [u8; 8],
+    /// 0 small, 1 medium, 2 large.
+    pub button_size: u32,
+    /// 0 thin, 1 normal, 2 thick.
+    pub seek_size: u32,
 }
 
 impl LayoutParams {
@@ -92,6 +103,8 @@ pub struct Layout {
     pub u: f32,
     /// Text size multiplier.
     pub t: f32,
+    /// Button size multiplier.
+    pub b: f32,
     pub gear: Rect,
     pub art: Rect,
     pub buttons: [Rect; 3],
@@ -112,49 +125,70 @@ impl Layout {
         let t = [0.92, 1.0, 1.15][p.text_size.min(2) as usize];
         let text_w = [140.0, 190.0, 260.0][p.width.min(2) as usize];
 
+        let bs = [0.85, 1.0, 1.18][p.button_size.min(2) as usize];
+
         let art_size = (h - 12.0 * u).min(40.0 * u).max(12.0).round();
         let art_y = ((h - art_size) / 2.0).round();
-
-        // Small settings button, level with the top of the art, to its left.
         let gear_size = (14.0 * u).round();
-        let gear = Rect { x: (3.0 * u).round(), y: art_y, w: gear_size, h: gear_size };
-
-        let art = Rect {
-            x: gear.x + gear.w + (3.0 * u).round(),
-            y: art_y,
-            w: art_size,
-            h: art_size,
-        };
-
-        // Shuffle, then previous / play-pause / next, then repeat. The two
-        // outer buttons are only there when the player supports them.
-        let extra = p.extra && !p.mini;
-        let ew = if extra { (23.0 * u).round() } else { 0.0 };
-        let bw = (28.0 * u).round();
-        let bh = art_size.min(32.0 * u).round();
+        let bw = (28.0 * u * bs).round();
+        let ew = (23.0 * u * bs).round();
+        let bh = art_size.min(32.0 * u * bs).round();
         let by = ((h - bh) / 2.0).round();
-        let sx = art.x + art.w + (6.0 * u).round();
-        let bx = sx + ew;
-        let buttons = [0.0, 1.0, 2.0].map(|i| Rect { x: bx + i * bw, y: by, w: bw, h: bh });
-        let rx = bx + 3.0 * bw;
-        let extras = if extra {
-            [sx, rx].map(|x| Rect { x, y: by, w: ew, h: bh })
-        } else {
-            [Rect::default(); 2]
-        };
 
-        let tx = rx + ew + (8.0 * u).round();
-        if p.mini {
-            return Layout {
-                width: bx + 3.0 * bw + (6.0 * u).round(),
-                u,
-                t,
-                gear,
-                art,
-                buttons,
-                ..Default::default()
-            };
+        let mut l = Layout { u, t, b: bs, ..Default::default() };
+
+        // Walk the items left to right, giving each its place.
+        let items: Vec<u8> = p
+            .order
+            .iter()
+            .copied()
+            .filter(|item| match *item {
+                0 => false,
+                ITEM_SHUFFLE | ITEM_REPEAT => p.extra && !p.mini,
+                ITEM_INFO => !p.mini,
+                _ => true,
+            })
+            .collect();
+        let mut x = if items.first() == Some(&ITEM_GEAR) { (3.0 * u).round() } else { (6.0 * u).round() };
+        let mut end_pad = 0.0;
+        for item in items {
+            end_pad = 0.0;
+            match item {
+                // Small, level with the top of the art.
+                ITEM_GEAR => {
+                    l.gear = Rect { x, y: art_y, w: gear_size, h: gear_size };
+                    x += gear_size + (3.0 * u).round();
+                }
+                ITEM_ART => {
+                    l.art = Rect { x, y: art_y, w: art_size, h: art_size };
+                    x += art_size + (6.0 * u).round();
+                }
+                ITEM_PREV | ITEM_PLAY | ITEM_NEXT => {
+                    l.buttons[(item - ITEM_PREV) as usize] = Rect { x, y: by, w: bw, h: bh };
+                    x += bw;
+                    end_pad = (6.0 * u).round();
+                }
+                ITEM_SHUFFLE | ITEM_REPEAT => {
+                    l.extras[usize::from(item == ITEM_REPEAT)] = Rect { x, y: by, w: ew, h: bh };
+                    x += ew;
+                    end_pad = (6.0 * u).round();
+                }
+                ITEM_INFO => {
+                    x += if x > 7.0 * u { (8.0 * u).round() } else { 0.0 };
+                    x = l.place_info(p, x, h, text_w);
+                    end_pad = (8.0 * u).round();
+                }
+                _ => {}
+            }
         }
+        l.width = (x + end_pad).max(12.0 * u);
+        l
+    }
+
+    /// Lay out the title row and the seek bar row starting at `tx`. Returns
+    /// the x just past them.
+    fn place_info(&mut self, p: &LayoutParams, tx: f32, h: f32, text_w: f32) -> f32 {
+        let (u, t) = (self.u, self.t);
         let tw = (text_w * u).round();
         let row1_h = 17.0 * u * t;
         let row2_h = 13.0 * u * t;
@@ -169,9 +203,8 @@ impl Layout {
             0.0
         };
         let label_gap = if p.show_times { 6.0 * u } else { 2.0 * u };
-        let elapsed = Rect { w: label_w, ..row2 };
         let total = Rect { x: tx + tw - label_w, w: label_w, ..row2 };
-        let track_h = (3.0 * u).round().max(2.0);
+        let track_h = ([2.0, 3.0, 5.0][p.seek_size.min(2) as usize] * u).round().max(2.0);
         let track_x = tx + label_w + label_gap;
         let track = Rect {
             x: track_x,
@@ -179,57 +212,44 @@ impl Layout {
             w: (total.x - label_gap - track_x).max(10.0),
             h: track_h,
         };
-        let seek_hit = Rect {
+        self.row1 = row1;
+        self.row2 = row2;
+        self.elapsed = Rect { w: label_w, ..row2 };
+        self.total = total;
+        self.track = track;
+        self.seek_hit = Rect {
             x: track.x - 5.0 * u,
             y: row2.y - 3.0 * u,
             w: track.w + 10.0 * u,
             h: h - (row2.y - 3.0 * u),
         };
-
-        Layout {
-            width: tx + tw + (8.0 * u).round(),
-            u,
-            t,
-            gear,
-            art,
-            buttons,
-            extras,
-            row1,
-            row2,
-            elapsed,
-            total,
-            track,
-            seek_hit,
-        }
+        tx + tw
     }
 
     pub fn hit(&self, x: f32, y: f32, has_timeline: bool) -> Hit {
         if has_timeline && self.seek_hit.contains(x, y) {
             return Hit::Seek;
         }
-        if x < self.art.x {
-            // Generous target around the little gear.
+        let within = |r: &Rect, pad: f32| r.w > 0.0 && x >= r.x - pad && x < r.x + r.w + pad;
+        // Generous target around the little gear.
+        if within(&self.gear, 3.0 * self.u) {
             return if y < self.gear.y + self.gear.h + 4.0 * self.u { Hit::Gear } else { Hit::None };
         }
-        // The art's click target is the full height of the taskbar.
-        if x < self.art.x + self.art.w + 3.0 * self.u {
+        // Art and buttons can be clicked over the full height of the taskbar.
+        if within(&self.art, 2.0 * self.u) {
             return Hit::Art;
         }
         for (i, b) in self.buttons.iter().enumerate() {
-            if x >= b.x && x < b.x + b.w {
+            if within(b, 0.0) {
                 return [Hit::Prev, Hit::Play, Hit::Next][i];
             }
         }
         for (i, b) in self.extras.iter().enumerate() {
-            if b.w > 0.0 && x >= b.x && x < b.x + b.w {
+            if within(b, 0.0) {
                 return [Hit::Shuffle, Hit::Repeat][i];
             }
         }
-        if self.row1.w > 0.0
-            && x >= self.row1.x
-            && x < self.row1.x + self.row1.w
-            && y < self.row2.y - 3.0 * self.u
-        {
+        if within(&self.row1, 0.0) && y < self.row2.y - 3.0 * self.u {
             return Hit::Title;
         }
         Hit::None
@@ -249,8 +269,12 @@ pub struct Frame {
     pub params: LayoutParams,
     pub smooth: bool,
     pub light: bool,
+    /// The main text of the first row.
     pub title: String,
+    /// Dimmer text after it on the same row; may be empty.
     pub artist: String,
+    /// Text for the second row when there is no seek bar there.
+    pub below: String,
     pub art_gen: u64,
     pub has_art: bool,
     pub playing: bool,
@@ -275,8 +299,15 @@ pub struct Frame {
     pub can_repeat: bool,
     /// 0 off, 1 track, 2 list.
     pub repeat: u8,
-    /// Color the seek bar from the album art.
-    pub accent: bool,
+    /// Highlight color: 0 from the album art, 1 `accent_rgb`, 2 none.
+    pub accent: u32,
+    pub accent_rgb: u32,
+    /// Album art corners: 0 rounded, 1 square, 2 circle.
+    pub art_shape: u32,
+    /// Backdrop behind the widget: 0 none, 1 subtle, 2 solid.
+    pub background: u32,
+    /// Index into `config::FONTS`.
+    pub font: u32,
     /// Volume percentage to show briefly in place of the seek bar.
     pub volume: Option<u8>,
     /// Short message to show briefly in place of the title.
@@ -480,8 +511,27 @@ unsafe fn draw(
     );
 
     let radius = 4.0 * u;
+    let family = FONTS[(f.font as usize).min(FONTS.len() - 1)];
+
+    // ---- backdrop ----------------------------------------------------------
+    if f.background != 0 {
+        let color = match (f.background, f.light) {
+            (1, _) => alpha(fg, 0x16),
+            (_, true) => 0xE6F3_F3F3,
+            (_, false) => 0xE61C_1C1C,
+        };
+        let inset = 3.0 * u;
+        let r = Rect {
+            x: 1.0 * u,
+            y: inset,
+            w: (f.w * k) as f32 - 2.0 * u,
+            h: (f.h * k) as f32 - 2.0 * inset,
+        };
+        fill_round_color(g, color, r, 7.0 * u);
+    }
 
     // ---- settings gear ---------------------------------------------------
+    if l.gear.w > 0.0 {
     if f.hover == Hit::Gear {
         let c = if f.pressed == Hit::Gear { plate_down } else { plate };
         let r = Rect { x: l.gear.x - u, y: l.gear.y - u, w: l.gear.w + 2.0 * u, h: l.gear.h + 2.0 * u };
@@ -494,9 +544,16 @@ unsafe fn draw(
         GdipFillEllipse(g, brush, l.gear.x + l.gear.w - r, l.gear.y - r * 0.4, r * 2.0, r * 2.0);
         GdipDeleteBrush(brush);
     }
+    }
 
     // ---- album art -------------------------------------------------------
-    let size = l.art.w as i32;
+    // The art is decoded even when hidden: the highlight color comes from it.
+    let size = if l.art.w > 0.0 { l.art.w as i32 } else { (40.0 * u) as i32 };
+    let art_radius = match f.art_shape {
+        1 => 0.0,
+        2 => l.art.w / 2.0,
+        _ => radius,
+    };
     if cache.as_ref().is_some_and(|c| c.art_gen != f.art_gen || c.size != size) {
         *cache = None;
     }
@@ -506,19 +563,20 @@ unsafe fn draw(
             *cache = Some(ArtCache { art_gen: f.art_gen, size, bitmap, accent });
         }
     }
+    if l.art.w > 0.0 {
     match cache {
         Some(c) if f.has_art => {
             let mut tex: *mut GpTexture = null_mut();
             GdipCreateTexture(c.bitmap as *mut GpImage, WrapModeClamp, &mut tex);
             if !tex.is_null() {
                 GdipTranslateTextureTransform(tex, l.art.x, l.art.y, MatrixOrderAppend);
-                fill_round(g, tex as *mut GpBrush, l.art, radius);
+                fill_round(g, tex as *mut GpBrush, l.art, art_radius);
                 GdipDeleteBrush(tex as *mut GpBrush);
             }
         }
         _ => {
-            fill_round_color(g, alpha(fg, 0x24), l.art, radius);
-            let font = make_font(w!("Segoe UI Symbol"), l.art.h * 0.55);
+            fill_round_color(g, alpha(fg, 0x24), l.art, art_radius);
+            let font = make_font("Segoe UI Symbol", l.art.h * 0.55, false);
             let fmt = make_format(StringAlignmentCenter, true);
             draw_text(g, "\u{266B}", font, l.art, fmt, dim);
             GdipDeleteFont(font);
@@ -526,9 +584,10 @@ unsafe fn draw(
         }
     }
     if f.pressed == Hit::Art && f.hover == Hit::Art {
-        fill_round_color(g, 0x4000_0000, l.art, radius);
+        fill_round_color(g, 0x4000_0000, l.art, art_radius);
     } else if f.hover == Hit::Art {
-        fill_round_color(g, 0x30FF_FFFF, l.art, radius);
+        fill_round_color(g, 0x30FF_FFFF, l.art, art_radius);
+    }
     }
 
     // ---- transport buttons -------------------------------------------------
@@ -536,6 +595,11 @@ unsafe fn draw(
     let enabled = [f.can_prev, f.can_toggle, f.can_next];
     for i in 0..3 {
         let b = l.buttons[i];
+        if b.w <= 0.0 {
+            continue;
+        }
+        // Icons scale with the chosen button size.
+        let u = u * l.b;
         if enabled[i] && f.hover == kinds[i] {
             let inner = Rect { x: b.x + u, w: b.w - 2.0 * u, ..b };
             let c = if f.pressed == kinds[i] { plate_down } else { plate };
@@ -563,19 +627,23 @@ unsafe fn draw(
         GdipDeleteBrush(brush);
     }
 
-    let accent = if f.accent && f.has_art {
-        cache.as_ref().and_then(|c| c.accent).map(|hs| accent_color(hs, f.light))
-    } else {
-        None
+    let accent = match f.accent {
+        0 if f.has_art => cache.as_ref().and_then(|c| c.accent).map(|hs| accent_color(hs, f.light)),
+        1 => Some(f.accent_rgb),
+        _ => None,
     };
 
     // ---- shuffle and repeat ------------------------------------------------
-    if l.extras[0].w > 0.0 {
+    {
         let kinds = [Hit::Shuffle, Hit::Repeat];
         let enabled = [f.can_shuffle, f.can_repeat];
         let active = [f.shuffle, f.repeat != 0];
         for i in 0..2 {
             let b = l.extras[i];
+            if b.w <= 0.0 {
+                continue;
+            }
+            let u = u * l.b;
             if enabled[i] && f.hover == kinds[i] {
                 let c = if f.pressed == kinds[i] { plate_down } else { plate };
                 fill_round_color(g, c, b, radius);
@@ -607,7 +675,7 @@ unsafe fn draw(
                     stroke_round(g, pen, r, 3.2 * u);
                     polygon(g, brush, &[(cx - 0.4 * u, r.y - 2.6 * u), (cx - 0.4 * u, r.y + 2.6 * u), (cx + 2.8 * u, r.y)]);
                     if f.repeat == 1 {
-                        let font = make_font(w!("Segoe UI Semibold"), 7.5 * u);
+                        let font = make_font("Segoe UI", 7.5 * u, true);
                         let fmt = make_format(StringAlignmentCenter, false);
                         let box1 = Rect { x: cx - 5.0 * u, y: cy - 4.4 * u, w: 10.0 * u, h: 9.0 * u };
                         draw_text(g, "1", font, box1, fmt, color);
@@ -626,13 +694,13 @@ unsafe fn draw(
     }
 
     // ---- text and seek bar -------------------------------------------------
-    if f.params.mini {
+    if l.row1.w <= 0.0 {
         return 0.0;
     }
     let ts = u * l.t;
-    let title_font = make_font(w!("Segoe UI Semibold"), 12.0 * ts);
-    let body_font = make_font(w!("Segoe UI"), 12.0 * ts);
-    let small_font = make_font(w!("Segoe UI"), 10.0 * ts);
+    let title_font = make_font(family, 12.0 * ts, true);
+    let body_font = make_font(family, 12.0 * ts, false);
+    let small_font = make_font(family, 10.0 * ts, false);
     let near = make_format(StringAlignmentNear, true);
     let far = make_format(StringAlignmentFar, true);
     let free = make_format(StringAlignmentNear, false);
@@ -644,7 +712,7 @@ unsafe fn draw(
         None if f.title.is_empty() => "Unknown track",
         None => f.title.as_str(),
     };
-    let artist = if f.notice.is_none() && f.has_timeline && !f.artist.is_empty() {
+    let artist = if f.notice.is_none() && !f.artist.is_empty() {
         format!("\u{00B7} {}", f.artist)
     } else {
         String::new()
@@ -710,8 +778,8 @@ unsafe fn draw(
         }
     } else {
         // No timeline from this player: artist on the second row.
-        let artist_font = make_font(w!("Segoe UI"), 11.0 * ts);
-        draw_text(g, &f.artist, artist_font, l.row2, near, dim);
+        let artist_font = make_font(family, 11.0 * ts, false);
+        draw_text(g, &f.below, artist_font, l.row2, near, dim);
         GdipDeleteFont(artist_font);
     }
 
@@ -860,9 +928,15 @@ unsafe fn fill_round_color(g: *mut GpGraphics, color: u32, r: Rect, radius: f32)
     GdipDeleteBrush(brush);
 }
 
-unsafe fn make_font(family: PCWSTR, px: f32) -> *mut GpFont {
+/// `bold` uses Segoe UI's own semibold face, and the bold style elsewhere.
+unsafe fn make_font(family: &str, px: f32, bold: bool) -> *mut GpFont {
+    let (name, style) = match (family, bold) {
+        ("Segoe UI", true) => ("Segoe UI Semibold", 0),
+        (_, true) => (family, 1),
+        _ => (family, 0),
+    };
     let mut fam: *mut GpFontFamily = null_mut();
-    GdipCreateFontFamilyFromName(family, null_mut(), &mut fam);
+    GdipCreateFontFamilyFromName(&HSTRING::from(name), null_mut(), &mut fam);
     if fam.is_null() {
         GdipCreateFontFamilyFromName(w!("Segoe UI"), null_mut(), &mut fam);
     }
@@ -870,7 +944,11 @@ unsafe fn make_font(family: PCWSTR, px: f32) -> *mut GpFont {
         GdipGetGenericFontFamilySansSerif(&mut fam);
     }
     let mut font: *mut GpFont = null_mut();
-    GdipCreateFont(fam, px.max(6.0), 0, UnitPixel, &mut font);
+    GdipCreateFont(fam, px.max(6.0), style, UnitPixel, &mut font);
+    if font.is_null() && style != 0 {
+        // Not every family has a bold face.
+        GdipCreateFont(fam, px.max(6.0), 0, UnitPixel, &mut font);
+    }
     GdipDeleteFontFamily(fam);
     font
 }
