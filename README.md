@@ -3,6 +3,8 @@
 A now-playing widget that sits on the Windows taskbar, immediately left of the
 notification area (tray icons and clock).
 
+![Taskbar Media on a dark and a light taskbar](docs/preview.png)
+
 From left to right:
 
 - A small settings button
@@ -24,6 +26,8 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 
 ## Settings
 
+<img src="docs/settings.png" alt="The settings window" width="436">
+
 - **Start with Windows**
 - **Hide while paused**
 - **Show media from**: any app, or Spotify only
@@ -42,8 +46,3 @@ the bottom or top of the screen. Taskbars on other displays exist only when
 
 Settings live in `HKCU\Software\TaskbarMedia`; "Start with Windows" adds a
 value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
-
-## Publish
-
-`publish-to-github.bat` commits everything in this folder with the message in
-`commit-message.txt` and pushes it to GitHub.

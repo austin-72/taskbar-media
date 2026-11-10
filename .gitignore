@@ -1,4 +1,5 @@
 /target/
 *.exe
 *.log
+*.bat
 commit-message.txt
