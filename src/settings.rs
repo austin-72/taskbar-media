@@ -339,7 +339,7 @@ pub fn open(module: HINSTANCE) {
             b.font,
         );
         y += 70;
-        b.checkbox("Shrink instead of covering app icons (Windows 11)", y, ID_AVOID, cfg.avoid_apps);
+        b.checkbox("Keep the widget clear of app icons", y, ID_AVOID, cfg.avoid_apps);
         y += 30;
         b.button("Reset positions", 16, y, 130, ID_RESET_POS, false);
 

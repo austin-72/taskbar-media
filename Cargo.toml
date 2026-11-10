@@ -1,5 +1,6 @@
 [package]
 name = "taskbar-media"
+license = "MIT"
 description = "Now-playing widget for the Windows taskbar"
 version = "1.0.0"
 edition = "2021"

@@ -16,6 +16,7 @@ mod launch;
 mod media;
 mod probe;
 mod render;
+mod reserve;
 mod settings;
 mod tray;
 
@@ -140,6 +141,8 @@ struct App {
     tray_shown: bool,
     tray_tip: String,
     anim_on: bool,
+    /// Windows 10: space can be reserved on the main taskbar.
+    can_reserve: bool,
     shared: Arc<Mutex<Snapshot>>,
     tx: Sender<Cmd>,
     snap: Snapshot,
@@ -533,6 +536,7 @@ impl App {
             }
         }
 
+        let mut reserved = false;
         let showable = self.snap.active && !(self.cfg.hide_paused && !self.snap.playing);
         let time_chars = format_time(self.snap.end - self.snap.start).len();
         for i in 0..self.widgets.len() {
@@ -566,7 +570,8 @@ impl App {
             let offset = if tb.primary { self.cfg.offset } else { self.cfg.offset2 };
             let right = anchor - (2.0 * scale) as i32 + offset;
 
-            // The space between the last app button and the tray, if known.
+            // The space between the last app button and the tray, if known
+            // (Windows 11; on Windows 10 space is reserved further down).
             let room = measured
                 .apps_right
                 .filter(|x| self.cfg.avoid_apps && *x > tb.rect.left && *x < right)
@@ -622,8 +627,19 @@ impl App {
                 widget.rect = rect;
                 widget.last_frame = None;
             }
+            // Windows 10: have Explorer keep its app buttons out of the way.
+            if self.can_reserve && self.cfg.avoid_apps && tb.primary {
+                reserved |= reserve::apply(tb.hwnd, x - (4.0 * scale) as i32);
+            }
             self.repaint(i);
             self.widgets[i].set_visible(true);
+        }
+        if self.can_reserve && !reserved {
+            if let Some(main) = bars.iter().find(|b| b.primary) {
+                reserve::restore(main.hwnd);
+            } else if let Ok(main) = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) } {
+                reserve::restore(main);
+            }
         }
 
         // Run the fast timer only while some visible title needs to scroll.
@@ -1065,6 +1081,7 @@ fn main() {
                 tray_shown: false,
                 tray_tip: String::new(),
                 anim_on: false,
+                can_reserve: reserve::supported(),
                 shared,
                 tx,
                 snap: Snapshot::default(),
@@ -1097,5 +1114,8 @@ fn main() {
                 tray::remove(a.controller);
             }
         });
+        if let Ok(main) = FindWindowW(w!("Shell_TrayWnd"), None) {
+            reserve::restore(main);
+        }
     }
 }

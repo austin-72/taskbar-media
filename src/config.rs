@@ -40,7 +40,7 @@ pub struct Config {
     pub scroll_titles: bool,
     /// Mouse wheel over the widget changes the system volume.
     pub wheel_volume: bool,
-    /// Shrink the widget rather than cover app buttons (Windows 11).
+    /// Keep clear of app buttons: reserve space (Windows 10) or shrink (11).
     pub avoid_apps: bool,
     pub tray_icon: bool,
     /// Sideways nudge in pixels, for the main taskbar and for the others.

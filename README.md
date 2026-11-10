@@ -16,7 +16,8 @@ It uses Windows' own media session API, so it works with anything that shows
 up in the Windows media flyout: Spotify (desktop and Store versions), browsers,
 Media Player, foobar2000, and so on. The widget hides itself when nothing is
 playing and when a full-screen app is in front. Titles that are too long to
-fit scroll, and on Windows 11 the widget shrinks rather than cover app icons.
+fit scroll. The widget keeps clear of app icons: on Windows 10 the taskbar's
+app area is narrowed to make room for it, and on Windows 11 the widget shrinks.
 
 ## Use
 
@@ -37,7 +38,7 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 - **Show on**: the main taskbar, all taskbars, or one chosen display
 - **Text size**, **width**, **text color**
 - **Rendering**: smooth (drawn at 2-3x and scaled down) or sharp (pixel-snapped)
-- **Shrink instead of covering app icons** (Windows 11)
+- **Keep the widget clear of app icons**
 - **Show elapsed and total time**
 - **Scroll long titles**
 
@@ -55,3 +56,7 @@ attaches a freshly built `TaskbarMedia.exe` to it.
 
 Settings live in `HKCU\Software\TaskbarMedia`; "Start with Windows" adds a
 value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+
+## License
+
+[MIT](LICENSE)
