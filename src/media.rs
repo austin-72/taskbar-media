@@ -2,7 +2,7 @@
 //! (GlobalSystemMediaTransportControls). Anything that reports "now playing"
 //! to Windows shows up here: Spotify, browsers, Media Player, foobar2000, etc.
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -175,10 +175,22 @@ fn is_playing(s: &Session) -> bool {
         .unwrap_or(false)
 }
 
+/// Set from the settings window: ignore every player except Spotify.
+pub static SPOTIFY_ONLY: AtomicBool = AtomicBool::new(false);
+
+fn allowed(s: &Session) -> bool {
+    if !SPOTIFY_ONLY.load(Ordering::Relaxed) {
+        return true;
+    }
+    s.SourceAppUserModelId()
+        .map(|id| id.to_string().to_lowercase().contains("spotify"))
+        .unwrap_or(false)
+}
+
 /// Prefer whatever is actually playing; otherwise fall back to the session
 /// Windows considers current (the one the hardware media keys would control).
 fn pick_session(mgr: &Manager) -> Option<Session> {
-    let current = mgr.GetCurrentSession().ok();
+    let current = mgr.GetCurrentSession().ok().filter(allowed);
     if let Some(c) = &current {
         if is_playing(c) {
             return current;
@@ -187,6 +199,9 @@ fn pick_session(mgr: &Manager) -> Option<Session> {
     let mut first = None;
     if let Ok(list) = mgr.GetSessions() {
         for s in list {
+            if !allowed(&s) {
+                continue;
+            }
             if is_playing(&s) {
                 return Some(s);
             }

@@ -1,0 +1,4 @@
+/target/
+*.exe
+*.log
+commit-message.txt

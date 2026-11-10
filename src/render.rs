@@ -1,6 +1,9 @@
-//! Layout and drawing. The widget is a per-pixel-alpha layered window, drawn
+//! Layout and drawing. Each widget is a per-pixel-alpha layered window, drawn
 //! with GDI+ into a 32-bit bitmap so it blends with whatever the taskbar looks
 //! like (dark, light, transparent, accent coloured).
+//!
+//! In "smooth" mode the frame is drawn at 2-3x size and averaged down, which
+//! gives text and shapes much finer anti-aliasing than GDI+ manages directly.
 #![allow(non_upper_case_globals)]
 
 use std::ptr::null_mut;
@@ -42,6 +45,7 @@ impl Rect {
 pub enum Hit {
     #[default]
     None,
+    Gear,
     Art,
     Prev,
     Play,
@@ -49,49 +53,98 @@ pub enum Hit {
     Seek,
 }
 
-/// Where everything sits, in physical pixels relative to the widget.
+/// Everything the layout depends on.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct LayoutParams {
+    /// Taskbar height in pixels.
+    pub height: i32,
+    /// DPI scale of the taskbar's monitor (1.0 = 96 dpi).
+    pub scale: f32,
+    /// Length of the "total time" label, which sets the label column width.
+    pub time_chars: usize,
+    /// 0 small, 1 medium, 2 large.
+    pub text_size: u32,
+    /// 0 compact, 1 normal, 2 wide.
+    pub width: u32,
+    pub show_times: bool,
+}
+
+impl LayoutParams {
+    fn scaled(&self, k: i32) -> Self {
+        LayoutParams { height: self.height * k, scale: self.scale * k as f32, ..*self }
+    }
+}
+
+/// Where everything sits, in pixels relative to the widget. From the left:
+/// settings gear, album art, transport buttons, then title over the seek bar.
 #[derive(Clone, Default, PartialEq)]
 pub struct Layout {
     pub width: f32,
     /// Layout unit: one 96-dpi pixel, shrunk further on small taskbars.
     pub u: f32,
+    /// Text size multiplier.
+    pub t: f32,
+    pub gear: Rect,
     pub art: Rect,
+    pub buttons: [Rect; 3],
     pub row1: Rect,
     pub row2: Rect,
     pub elapsed: Rect,
     pub total: Rect,
     pub track: Rect,
     pub seek_hit: Rect,
-    pub buttons: [Rect; 3],
 }
 
 impl Layout {
-    pub fn new(height: i32, scale: f32, time_chars: usize) -> Self {
-        let h = height as f32;
-        let u = scale.min(h / 40.0).max(0.5);
+    pub fn new(p: &LayoutParams) -> Self {
+        let h = p.height as f32;
+        let u = p.scale.min(h / 40.0).max(0.5);
+        let t = [0.92, 1.0, 1.15][p.text_size.min(2) as usize];
+        let text_w = [140.0, 190.0, 260.0][p.width.min(2) as usize];
 
-        let pad = (8.0 * u).round();
         let art_size = (h - 12.0 * u).min(40.0 * u).max(12.0).round();
-        let art = Rect { x: pad, y: ((h - art_size) / 2.0).round(), w: art_size, h: art_size };
+        let art_y = ((h - art_size) / 2.0).round();
 
-        let tx = art.x + art.w + (9.0 * u).round();
-        let tw = (190.0 * u).round();
-        let row1_h = 17.0 * u;
-        let row2_h = 13.0 * u;
+        // Small settings button, level with the top of the art, to its left.
+        let gear_size = (14.0 * u).round();
+        let gear = Rect { x: (3.0 * u).round(), y: art_y, w: gear_size, h: gear_size };
+
+        let art = Rect {
+            x: gear.x + gear.w + (3.0 * u).round(),
+            y: art_y,
+            w: art_size,
+            h: art_size,
+        };
+
+        let bw = (28.0 * u).round();
+        let bh = art_size.min(32.0 * u).round();
+        let bx = art.x + art.w + (6.0 * u).round();
+        let by = ((h - bh) / 2.0).round();
+        let buttons = [0.0, 1.0, 2.0].map(|i| Rect { x: bx + i * bw, y: by, w: bw, h: bh });
+
+        let tx = bx + 3.0 * bw + (8.0 * u).round();
+        let tw = (text_w * u).round();
+        let row1_h = 17.0 * u * t;
+        let row2_h = 13.0 * u * t;
         let gap = 1.0 * u;
         let ty = ((h - (row1_h + gap + row2_h)) / 2.0).floor();
         let row1 = Rect { x: tx, y: ty, w: tw, h: row1_h };
         let row2 = Rect { x: tx, y: ty + row1_h + gap, w: tw, h: row2_h };
 
-        let label_w = (time_chars.max(4) as f32 * 5.6 + 3.0) * u;
+        let label_w = if p.show_times {
+            (p.time_chars.max(4) as f32 * 5.6 + 3.0) * u * t
+        } else {
+            0.0
+        };
+        let label_gap = if p.show_times { 6.0 * u } else { 2.0 * u };
         let elapsed = Rect { w: label_w, ..row2 };
         let total = Rect { x: tx + tw - label_w, w: label_w, ..row2 };
         let track_h = (3.0 * u).round().max(2.0);
-        let track_x = tx + label_w + 6.0 * u;
+        let track_x = tx + label_w + label_gap;
         let track = Rect {
             x: track_x,
             y: (row2.cy() - track_h / 2.0).round(),
-            w: (total.x - 6.0 * u - track_x).max(10.0),
+            w: (total.x - label_gap - track_x).max(10.0),
             h: track_h,
         };
         let seek_hit = Rect {
@@ -101,23 +154,19 @@ impl Layout {
             h: h - (row2.y - 3.0 * u),
         };
 
-        let bw = (30.0 * u).round();
-        let bh = art_size.min(32.0 * u).round();
-        let bx = tx + tw + (6.0 * u).round();
-        let by = ((h - bh) / 2.0).round();
-        let buttons = [0.0, 1.0, 2.0].map(|i| Rect { x: bx + i * bw, y: by, w: bw, h: bh });
-
         Layout {
-            width: bx + 3.0 * bw + (6.0 * u).round(),
+            width: tx + tw + (8.0 * u).round(),
             u,
+            t,
+            gear,
             art,
+            buttons,
             row1,
             row2,
             elapsed,
             total,
             track,
             seek_hit,
-            buttons,
         }
     }
 
@@ -125,8 +174,12 @@ impl Layout {
         if has_timeline && self.seek_hit.contains(x, y) {
             return Hit::Seek;
         }
+        if x < self.art.x {
+            // Generous target around the little gear.
+            return if y < self.gear.y + self.gear.h + 4.0 * self.u { Hit::Gear } else { Hit::None };
+        }
         // The art's click target is the full height of the taskbar.
-        if x >= 0.0 && x < self.art.x + self.art.w + 3.0 * self.u {
+        if x < self.art.x + self.art.w + 3.0 * self.u {
             return Hit::Art;
         }
         for (i, b) in self.buttons.iter().enumerate() {
@@ -142,12 +195,14 @@ impl Layout {
     }
 }
 
-/// Everything that affects the picture. The window is only redrawn when this
-/// differs from the last frame.
+/// Everything that affects the picture. A widget is only redrawn when this
+/// differs from its last frame.
 #[derive(Clone, Default, PartialEq)]
 pub struct Frame {
     pub w: i32,
     pub h: i32,
+    pub params: LayoutParams,
+    pub smooth: bool,
     pub light: bool,
     pub title: String,
     pub artist: String,
@@ -161,21 +216,26 @@ pub struct Frame {
     pub has_timeline: bool,
     pub elapsed: String,
     pub total: String,
-    pub fill_px: i32,
+    /// Played fraction, 0..=1 (quantised to whole pixels by the caller).
+    pub fill: f32,
     pub hover: Hit,
     pub pressed: Hit,
     pub dragging: bool,
 }
 
-struct ArtCache {
-    gen: u64,
+/// A widget's album art, decoded and scaled to the size it is drawn at.
+pub struct ArtCache {
+    art_gen: u64,
     size: i32,
     bitmap: *mut GpBitmap,
 }
 
-pub struct Renderer {
-    _token: usize,
-    art: Option<ArtCache>,
+impl Drop for ArtCache {
+    fn drop(&mut self) {
+        unsafe {
+            GdipDisposeImage(self.bitmap as *mut GpImage);
+        }
+    }
 }
 
 /// 32-bit premultiplied ARGB, the format layered windows expect.
@@ -185,231 +245,324 @@ fn alpha(color: u32, a: u32) -> u32 {
     (color & 0x00FF_FFFF) | (a << 24)
 }
 
-impl Renderer {
-    pub fn new() -> Self {
-        let mut token = 0usize;
-        let input = GdiplusStartupInput { GdiplusVersion: 1, ..Default::default() };
-        unsafe {
-            GdiplusStartup(&mut token, &input, null_mut());
-        }
-        Renderer { _token: token, art: None }
+/// Start GDI+. Call once, before any painting.
+pub fn init() {
+    let mut token = 0usize;
+    let input = GdiplusStartupInput { GdiplusVersion: 1, ..Default::default() };
+    unsafe {
+        GdiplusStartup(&mut token, &input, null_mut());
     }
+}
 
-    /// `spotify` enables detection of the framed thumbnail some Spotify
-    /// versions publish (see `legacy_spotify_crop`).
-    pub fn paint(&mut self, hwnd: HWND, f: &Frame, l: &Layout, art: Option<&[u8]>, spotify: bool) {
-        if f.w <= 0 || f.h <= 0 {
+/// Draw `f` and push it to the layered window.
+///
+/// `spotify` enables detection of the framed thumbnail some Spotify versions
+/// publish (see `legacy_spotify_frame`).
+pub fn paint(
+    hwnd: HWND,
+    f: &Frame,
+    cache: &mut Option<ArtCache>,
+    art: Option<&[u8]>,
+    spotify: bool,
+) {
+    if f.w <= 0 || f.h <= 0 {
+        return;
+    }
+    // Supersampling factor.
+    let k: i32 = if !f.smooth {
+        1
+    } else if f.params.scale >= 1.75 {
+        2
+    } else {
+        3
+    };
+    let (bw, bh) = (f.w * k, f.h * k);
+    let layout = Layout::new(&f.params.scaled(k));
+    let mut big = vec![0u32; (bw * bh) as usize];
+
+    unsafe {
+        let mut bitmap: *mut GpBitmap = null_mut();
+        GdipCreateBitmapFromScan0(
+            bw,
+            bh,
+            bw * 4,
+            PixelFormat32bppPARGB as i32,
+            Some(big.as_mut_ptr() as *const u8),
+            &mut bitmap,
+        );
+        if bitmap.is_null() {
             return;
         }
-        unsafe {
-            let screen = GetDC(None);
-            let mem = CreateCompatibleDC(Some(screen));
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: f.w,
-                    biHeight: -f.h, // top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    ..Default::default()
-                },
+        let mut g: *mut GpGraphics = null_mut();
+        GdipGetImageGraphicsContext(bitmap as *mut GpImage, &mut g);
+        if !g.is_null() {
+            draw(g, f, &layout, k > 1, cache, art, spotify);
+            GdipFlush(g, FlushIntentionSync);
+            GdipDeleteGraphics(g);
+        }
+        GdipDisposeImage(bitmap as *mut GpImage);
+
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(Some(screen));
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: f.w,
+                biHeight: -f.h, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
                 ..Default::default()
-            };
-            let mut bits: *mut core::ffi::c_void = null_mut();
-            if let std::result::Result::Ok(dib) = CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
-                if !bits.is_null() {
-                    let old = SelectObject(mem, dib.into());
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = null_mut();
+        if let std::result::Result::Ok(dib) =
+            CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        {
+            if !bits.is_null() {
+                let out = std::slice::from_raw_parts_mut(bits as *mut u32, (f.w * f.h) as usize);
+                downsample(&big, bw as usize, out, f.w as usize, f.h as usize, k as usize);
 
-                    let mut bitmap: *mut GpBitmap = null_mut();
-                    GdipCreateBitmapFromScan0(
-                        f.w,
-                        f.h,
-                        f.w * 4,
-                        PixelFormat32bppPARGB as i32,
-                        Some(bits as *const u8),
-                        &mut bitmap,
-                    );
-                    if !bitmap.is_null() {
-                        let mut g: *mut GpGraphics = null_mut();
-                        GdipGetImageGraphicsContext(bitmap as *mut GpImage, &mut g);
-                        if !g.is_null() {
-                            self.draw(g, f, l, art, spotify);
-                            GdipFlush(g, FlushIntentionSync);
-                            GdipDeleteGraphics(g);
-                        }
-                        GdipDisposeImage(bitmap as *mut GpImage);
-                    }
-
-                    let size = SIZE { cx: f.w, cy: f.h };
-                    let origin = POINT::default();
-                    let blend = BLENDFUNCTION {
-                        BlendOp: AC_SRC_OVER as u8,
-                        BlendFlags: 0,
-                        SourceConstantAlpha: 255,
-                        AlphaFormat: AC_SRC_ALPHA as u8,
-                    };
-                    let _ = UpdateLayeredWindow(
-                        hwnd,
-                        Some(screen),
-                        None,
-                        Some(&size),
-                        Some(mem),
-                        Some(&origin),
-                        COLORREF(0),
-                        Some(&blend),
-                        ULW_ALPHA,
-                    );
-                    SelectObject(mem, old);
-                }
-                let _ = DeleteObject(dib.into());
+                let old = SelectObject(mem, dib.into());
+                let size = SIZE { cx: f.w, cy: f.h };
+                let origin = POINT::default();
+                let blend = BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: 255,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                };
+                let _ = UpdateLayeredWindow(
+                    hwnd,
+                    Some(screen),
+                    None,
+                    Some(&size),
+                    Some(mem),
+                    Some(&origin),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                );
+                SelectObject(mem, old);
             }
-            let _ = DeleteDC(mem);
-            ReleaseDC(None, screen);
+            let _ = DeleteObject(dib.into());
+        }
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+    }
+}
+
+/// Box-filter `src` (k times larger each way) into `dst`. Pixels are
+/// premultiplied, so the channels can simply be averaged.
+fn downsample(src: &[u32], src_w: usize, dst: &mut [u32], w: usize, h: usize, k: usize) {
+    let n = (k * k) as u32;
+    for y in 0..h {
+        for x in 0..w {
+            let mut px = if k == 1 {
+                src[y * src_w + x]
+            } else {
+                let (mut a, mut r, mut g, mut b) = (0u32, 0u32, 0u32, 0u32);
+                for sy in 0..k {
+                    let row = (y * k + sy) * src_w + x * k;
+                    for &p in &src[row..row + k] {
+                        a += p >> 24;
+                        r += (p >> 16) & 0xFF;
+                        g += (p >> 8) & 0xFF;
+                        b += p & 0xFF;
+                    }
+                }
+                let avg = |v: u32| (v + n / 2) / n;
+                (avg(a) << 24) | (avg(r) << 16) | (avg(g) << 8) | avg(b)
+            };
+            // Alpha 1 rather than 0: fully transparent pixels of a layered
+            // window let the mouse fall through to the taskbar underneath.
+            if px >> 24 == 0 {
+                px = 0x0100_0000;
+            }
+            dst[y * w + x] = px;
         }
     }
+}
 
-    unsafe fn draw(
-        &mut self,
-        g: *mut GpGraphics,
-        f: &Frame,
-        l: &Layout,
-        art: Option<&[u8]>,
-        spotify: bool,
-    ) {
-        let u = l.u;
-        let fg: u32 = if f.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
-        let primary = alpha(fg, if f.light { 0xE4 } else { 0xFF });
-        let dim = alpha(fg, 0x9E);
-        let disabled = alpha(fg, 0x48);
-        let plate = alpha(fg, if f.light { 0x12 } else { 0x1C });
-        let plate_down = alpha(fg, if f.light { 0x0A } else { 0x10 });
+unsafe fn draw(
+    g: *mut GpGraphics,
+    f: &Frame,
+    l: &Layout,
+    supersampled: bool,
+    cache: &mut Option<ArtCache>,
+    art: Option<&[u8]>,
+    spotify: bool,
+) {
+    let u = l.u;
+    let fg: u32 = if f.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
+    let primary = alpha(fg, if f.light { 0xE4 } else { 0xFF });
+    let dim = alpha(fg, 0x9E);
+    let disabled = alpha(fg, 0x48);
+    let plate = alpha(fg, if f.light { 0x12 } else { 0x1C });
+    let plate_down = alpha(fg, if f.light { 0x0A } else { 0x10 });
 
-        // Alpha 1 rather than 0: fully transparent pixels of a layered window
-        // let the mouse fall through to the taskbar underneath.
-        GdipGraphicsClear(g, 0x0100_0000);
-        GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-        GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
-        GdipSetTextRenderingHint(g, TextRenderingHintAntiAliasGridFit);
+    GdipGraphicsClear(g, 0x0000_0000);
+    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+    GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+    // When supersampling, leave glyphs unhinted so their shapes stay true
+    // after averaging; otherwise snap them to the pixel grid for crispness.
+    GdipSetTextRenderingHint(
+        g,
+        if supersampled { TextRenderingHintAntiAlias } else { TextRenderingHintAntiAliasGridFit },
+    );
 
-        let radius = 4.0 * u;
+    let radius = 4.0 * u;
 
-        // ---- album art -------------------------------------------------
-        let size = l.art.w as i32;
-        if self.art.as_ref().is_some_and(|c| c.gen != f.art_gen || c.size != size) {
-            if let Some(c) = self.art.take() {
-                GdipDisposeImage(c.bitmap as *mut GpImage);
+    // ---- settings gear ---------------------------------------------------
+    if f.hover == Hit::Gear {
+        let c = if f.pressed == Hit::Gear { plate_down } else { plate };
+        let r = Rect { x: l.gear.x - u, y: l.gear.y - u, w: l.gear.w + 2.0 * u, h: l.gear.h + 2.0 * u };
+        fill_round_color(g, c, r, 3.0 * u);
+    }
+    draw_gear(g, l.gear.cx(), l.gear.cy(), l.gear.w * 0.40, if f.hover == Hit::Gear { primary } else { dim });
+
+    // ---- album art -------------------------------------------------------
+    let size = l.art.w as i32;
+    if cache.as_ref().is_some_and(|c| c.art_gen != f.art_gen || c.size != size) {
+        *cache = None;
+    }
+    if cache.is_none() && f.has_art {
+        if let Some(bitmap) = art.and_then(|bytes| scale_art(bytes, size, spotify)) {
+            *cache = Some(ArtCache { art_gen: f.art_gen, size, bitmap });
+        }
+    }
+    match cache {
+        Some(c) if f.has_art => {
+            let mut tex: *mut GpTexture = null_mut();
+            GdipCreateTexture(c.bitmap as *mut GpImage, WrapModeClamp, &mut tex);
+            if !tex.is_null() {
+                GdipTranslateTextureTransform(tex, l.art.x, l.art.y, MatrixOrderAppend);
+                fill_round(g, tex as *mut GpBrush, l.art, radius);
+                GdipDeleteBrush(tex as *mut GpBrush);
             }
         }
-        if self.art.is_none() && f.has_art {
-            if let Some(bitmap) = art.and_then(|bytes| scale_art(bytes, size, spotify)) {
-                self.art = Some(ArtCache { gen: f.art_gen, size, bitmap });
-            }
+        _ => {
+            fill_round_color(g, alpha(fg, 0x24), l.art, radius);
+            let font = make_font(w!("Segoe UI Symbol"), l.art.h * 0.55);
+            let fmt = make_format(StringAlignmentCenter);
+            draw_text(g, "\u{266B}", font, l.art, fmt, dim);
+            GdipDeleteFont(font);
+            GdipDeleteStringFormat(fmt);
         }
-        match &self.art {
-            Some(c) if f.has_art => {
-                let mut tex: *mut GpTexture = null_mut();
-                GdipCreateTexture(c.bitmap as *mut GpImage, WrapModeClamp, &mut tex);
-                if !tex.is_null() {
-                    GdipTranslateTextureTransform(tex, l.art.x, l.art.y, MatrixOrderAppend);
-                    fill_round(g, tex as *mut GpBrush, l.art, radius);
-                    GdipDeleteBrush(tex as *mut GpBrush);
-                }
+    }
+    if f.pressed == Hit::Art && f.hover == Hit::Art {
+        fill_round_color(g, 0x4000_0000, l.art, radius);
+    } else if f.hover == Hit::Art {
+        fill_round_color(g, 0x30FF_FFFF, l.art, radius);
+    }
+
+    // ---- transport buttons -------------------------------------------------
+    let kinds = [Hit::Prev, Hit::Play, Hit::Next];
+    let enabled = [f.can_prev, f.can_toggle, f.can_next];
+    for i in 0..3 {
+        let b = l.buttons[i];
+        if enabled[i] && f.hover == kinds[i] {
+            let inner = Rect { x: b.x + u, w: b.w - 2.0 * u, ..b };
+            let c = if f.pressed == kinds[i] { plate_down } else { plate };
+            fill_round_color(g, c, inner, radius);
+        }
+        let brush = solid(if enabled[i] { primary } else { disabled });
+        let (cx, cy) = (b.cx(), b.cy());
+        match kinds[i] {
+            Hit::Play if f.playing => {
+                GdipFillRectangle(g, brush, cx - 5.0 * u, cy - 6.0 * u, 3.5 * u, 12.0 * u);
+                GdipFillRectangle(g, brush, cx + 1.5 * u, cy - 6.0 * u, 3.5 * u, 12.0 * u);
+            }
+            Hit::Play => {
+                polygon(g, brush, &[(cx - 4.0 * u, cy - 6.5 * u), (cx - 4.0 * u, cy + 6.5 * u), (cx + 6.5 * u, cy)]);
+            }
+            Hit::Next => {
+                polygon(g, brush, &[(cx - 5.5 * u, cy - 5.0 * u), (cx - 5.5 * u, cy + 5.0 * u), (cx + 3.0 * u, cy)]);
+                GdipFillRectangle(g, brush, cx + 3.5 * u, cy - 5.0 * u, 2.0 * u, 10.0 * u);
             }
             _ => {
-                fill_round_color(g, alpha(fg, 0x24), l.art, radius);
-                let font = make_font(w!("Segoe UI Symbol"), l.art.h * 0.55);
-                let fmt = make_format(StringAlignmentCenter);
-                draw_text(g, "\u{266B}", font, l.art, fmt, dim);
-                GdipDeleteFont(font);
-                GdipDeleteStringFormat(fmt);
+                polygon(g, brush, &[(cx + 5.5 * u, cy - 5.0 * u), (cx + 5.5 * u, cy + 5.0 * u), (cx - 3.0 * u, cy)]);
+                GdipFillRectangle(g, brush, cx - 5.5 * u, cy - 5.0 * u, 2.0 * u, 10.0 * u);
             }
         }
-        if f.pressed == Hit::Art && f.hover == Hit::Art {
-            fill_round_color(g, 0x4000_0000, l.art, radius);
-        } else if f.hover == Hit::Art {
-            fill_round_color(g, 0x30FF_FFFF, l.art, radius);
+        GdipDeleteBrush(brush);
+    }
+
+    // ---- text and seek bar -------------------------------------------------
+    let ts = u * l.t;
+    let title_font = make_font(w!("Segoe UI Semibold"), 12.0 * ts);
+    let body_font = make_font(w!("Segoe UI"), 12.0 * ts);
+    let small_font = make_font(w!("Segoe UI"), 10.0 * ts);
+    let near = make_format(StringAlignmentNear);
+    let far = make_format(StringAlignmentFar);
+
+    let title = if f.title.is_empty() { "Unknown track" } else { f.title.as_str() };
+    if f.has_timeline {
+        // Row 1: "Title · Artist", row 2: the seek bar.
+        let title_w = measure(g, title, title_font, l.row1, near).min(l.row1.w);
+        draw_text(g, title, title_font, l.row1, near, primary);
+        let rest = l.row1.w - title_w;
+        if !f.artist.is_empty() && rest > 36.0 * u {
+            let r = Rect { x: l.row1.x + title_w, w: rest, ..l.row1 };
+            draw_text(g, &format!("\u{00B7} {}", f.artist), body_font, r, near, dim);
         }
 
-        // ---- text ------------------------------------------------------
-        let title_font = make_font(w!("Segoe UI Semibold"), 12.0 * u);
-        let body_font = make_font(w!("Segoe UI"), 12.0 * u);
-        let small_font = make_font(w!("Segoe UI"), 10.0 * u);
-        let near = make_format(StringAlignmentNear);
-        let far = make_format(StringAlignmentFar);
-
-        let title = if f.title.is_empty() { "Unknown track" } else { f.title.as_str() };
-        if f.has_timeline {
-            // Row 1: "Title · Artist", row 2: the seek bar.
-            let title_w = measure(g, title, title_font, l.row1, near).min(l.row1.w);
-            draw_text(g, title, title_font, l.row1, near, primary);
-            let rest = l.row1.w - title_w;
-            if !f.artist.is_empty() && rest > 36.0 * u {
-                let r = Rect { x: l.row1.x + title_w, w: rest, ..l.row1 };
-                draw_text(g, &format!("\u{00B7} {}", f.artist), body_font, r, near, dim);
-            }
-
+        if f.params.show_times {
             draw_text(g, &f.elapsed, small_font, l.elapsed, near, dim);
             draw_text(g, &f.total, small_font, l.total, far, dim);
-
-            let t = l.track;
-            fill_round_color(g, alpha(fg, 0x3A), t, t.h / 2.0);
-            let fill = (f.fill_px as f32).clamp(0.0, t.w);
-            if fill >= 1.0 {
-                let color = if f.can_seek { primary } else { dim };
-                fill_round_color(g, color, Rect { w: fill.max(t.h), ..t }, t.h / 2.0);
-            }
-            if f.can_seek && (f.hover == Hit::Seek || f.dragging) {
-                let r = if f.dragging { 5.0 * u } else { 4.0 * u };
-                let brush = solid(alpha(fg, 0xFF));
-                GdipFillEllipse(g, brush, t.x + fill - r, t.cy() - r, r * 2.0, r * 2.0);
-                GdipDeleteBrush(brush);
-            }
-        } else {
-            // No timeline from this player: title above, artist below.
-            draw_text(g, title, title_font, l.row1, near, primary);
-            let artist_font = make_font(w!("Segoe UI"), 11.0 * u);
-            draw_text(g, &f.artist, artist_font, l.row2, near, dim);
-            GdipDeleteFont(artist_font);
         }
 
-        GdipDeleteFont(title_font);
-        GdipDeleteFont(body_font);
-        GdipDeleteFont(small_font);
-        GdipDeleteStringFormat(near);
-        GdipDeleteStringFormat(far);
-
-        // ---- transport buttons ------------------------------------------
-        let kinds = [Hit::Prev, Hit::Play, Hit::Next];
-        let enabled = [f.can_prev, f.can_toggle, f.can_next];
-        for i in 0..3 {
-            let b = l.buttons[i];
-            if enabled[i] && f.hover == kinds[i] {
-                let inner = Rect { x: b.x + u, w: b.w - 2.0 * u, ..b };
-                let c = if f.pressed == kinds[i] { plate_down } else { plate };
-                fill_round_color(g, c, inner, radius);
-            }
-            let brush = solid(if enabled[i] { primary } else { disabled });
-            let (cx, cy) = (b.cx(), b.cy());
-            match kinds[i] {
-                Hit::Play if f.playing => {
-                    GdipFillRectangle(g, brush, cx - 5.0 * u, cy - 6.0 * u, 3.5 * u, 12.0 * u);
-                    GdipFillRectangle(g, brush, cx + 1.5 * u, cy - 6.0 * u, 3.5 * u, 12.0 * u);
-                }
-                Hit::Play => {
-                    polygon(g, brush, &[(cx - 4.0 * u, cy - 6.5 * u), (cx - 4.0 * u, cy + 6.5 * u), (cx + 6.5 * u, cy)]);
-                }
-                Hit::Next => {
-                    polygon(g, brush, &[(cx - 5.5 * u, cy - 5.0 * u), (cx - 5.5 * u, cy + 5.0 * u), (cx + 3.0 * u, cy)]);
-                    GdipFillRectangle(g, brush, cx + 3.5 * u, cy - 5.0 * u, 2.0 * u, 10.0 * u);
-                }
-                _ => {
-                    polygon(g, brush, &[(cx + 5.5 * u, cy - 5.0 * u), (cx + 5.5 * u, cy + 5.0 * u), (cx - 3.0 * u, cy)]);
-                    GdipFillRectangle(g, brush, cx - 5.5 * u, cy - 5.0 * u, 2.0 * u, 10.0 * u);
-                }
-            }
+        let t = l.track;
+        fill_round_color(g, alpha(fg, 0x3A), t, t.h / 2.0);
+        let fill = (f.fill * t.w).clamp(0.0, t.w);
+        if fill >= 1.0 {
+            let color = if f.can_seek { primary } else { dim };
+            fill_round_color(g, color, Rect { w: fill.max(t.h), ..t }, t.h / 2.0);
+        }
+        if f.can_seek && (f.hover == Hit::Seek || f.dragging) {
+            let r = if f.dragging { 5.0 * u } else { 4.0 * u };
+            let brush = solid(alpha(fg, 0xFF));
+            GdipFillEllipse(g, brush, t.x + fill - r, t.cy() - r, r * 2.0, r * 2.0);
             GdipDeleteBrush(brush);
         }
+    } else {
+        // No timeline from this player: title above, artist below.
+        draw_text(g, title, title_font, l.row1, near, primary);
+        let artist_font = make_font(w!("Segoe UI"), 11.0 * ts);
+        draw_text(g, &f.artist, artist_font, l.row2, near, dim);
+        GdipDeleteFont(artist_font);
     }
+
+    GdipDeleteFont(title_font);
+    GdipDeleteFont(body_font);
+    GdipDeleteFont(small_font);
+    GdipDeleteStringFormat(near);
+    GdipDeleteStringFormat(far);
+}
+
+/// An eight-toothed cog with a round hole, centred on (cx, cy).
+unsafe fn draw_gear(g: *mut GpGraphics, cx: f32, cy: f32, radius: f32, color: u32) {
+    let root = radius * 0.74;
+    let mut pts: Vec<PointF> = Vec::with_capacity(32);
+    for tooth in 0..8 {
+        let a = tooth as f32 * 45.0;
+        for (r, da) in [(root, -14.0f32), (radius, -8.5), (radius, 8.5), (root, 14.0)] {
+            let rad = (a + da).to_radians();
+            pts.push(PointF { X: cx + r * rad.cos(), Y: cy + r * rad.sin() });
+        }
+    }
+    let mut path: *mut GpPath = null_mut();
+    GdipCreatePath(FillModeAlternate, &mut path);
+    if path.is_null() {
+        return;
+    }
+    GdipAddPathPolygon(path, pts.as_ptr(), pts.len() as i32);
+    let hole = radius * 0.36;
+    GdipAddPathEllipse(path, cx - hole, cy - hole, hole * 2.0, hole * 2.0);
+    let brush = solid(color);
+    GdipFillPath(g, brush, path);
+    GdipDeleteBrush(brush);
+    GdipDeletePath(path);
 }
 
 unsafe fn solid(color: u32) -> *mut GpBrush {
