@@ -1,0 +1,4 @@
+# Build the Microsoft C runtime into the exe, so it runs on PCs that do not
+# have the Visual C++ redistributable (VCRUNTIME140.dll) installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
