@@ -24,7 +24,7 @@ mod update;
 mod volume;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,7 +60,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use config::{Config, DISPLAY_ALL, DISPLAY_ONE};
 use media::{Cmd, Snapshot};
-use render::{ArtCache, Frame, Hit, Layout, LayoutParams};
+use render::{ArtCache, Card, Frame, Hit, Layout, LayoutParams};
 
 const WM_APP_UPDATE: u32 = WM_APP + 1;
 const TIMER_ID: usize = 1;
@@ -75,6 +75,8 @@ const WIDGET_CLASS: PCWSTR = w!("TaskbarMediaWidget");
 static CONTROLLER_HWND: AtomicIsize = AtomicIsize::new(0);
 /// The "TaskbarCreated" message Explorer broadcasts when it (re)starts.
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// A popup menu is showing, so the hover card should stay out of the way.
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -90,6 +92,15 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 /// Used by the settings window.
 pub fn current_config() -> Config {
     with_app(|a| a.cfg.clone()).unwrap_or_else(Config::load)
+}
+
+/// Re-read every setting from the registry and apply it (after an import or
+/// a reset).
+pub fn reload_config() {
+    with_app(|a| {
+        a.cfg = Config::load();
+        a.apply_config();
+    });
 }
 
 /// Change settings, save them, and apply them straight away.
@@ -149,6 +160,14 @@ struct App {
     tray_shown: bool,
     tray_tip: String,
     anim_on: bool,
+    /// The hover card's window, what it last showed, and whether it is up.
+    card: HWND,
+    card_frame: Option<Card>,
+    card_visible: bool,
+    /// The widget the mouse is resting on, and since when.
+    hover_since: Option<(usize, Instant)>,
+    /// A click put the card away; it stays away until the mouse leaves.
+    card_dismissed: bool,
     /// Windows 10: space can be reserved on the main taskbar.
     can_reserve: bool,
     shared: Arc<Mutex<Snapshot>>,
@@ -395,11 +414,19 @@ impl App {
         self.snap.end > self.snap.start
     }
 
-    fn light_text_on_dark(&self) -> bool {
+    /// The text color (0xFFRRGGBB), and whether it is a dark color meant
+    /// for a light taskbar.
+    fn text_color(&self) -> (u32, bool) {
         match self.cfg.text_color {
-            1 => true,
-            2 => false,
-            _ => !self.system_light,
+            1 => (0xFFFF_FFFF, false),
+            2 => (0xFF00_0000, true),
+            3 => {
+                let c = self.cfg.text_rgb;
+                let (r, g, b) = ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+                (c | 0xFF00_0000, (r * 299 + g * 587 + b * 114) / 1000 < 128)
+            }
+            _ if self.system_light => (0xFF00_0000, true),
+            _ => (0xFFFF_FFFF, false),
         }
     }
 
@@ -541,7 +568,7 @@ impl App {
             self.system_light = config::system_light_theme();
             // The output can change behind our back (a headset is plugged
             // in, or the user switches in Windows), so look every 2 seconds.
-            self.output = if self.cfg.order().contains(&config::ITEM_OUTPUT) && self.snap.active {
+            self.output = if self.cfg.shows(config::ITEM_OUTPUT) && self.snap.active {
                 devices::current()
             } else {
                 None
@@ -628,7 +655,7 @@ impl App {
                 show_times: self.cfg.show_times,
                 mini: false,
                 extra: self.snap.can_shuffle || self.snap.can_repeat,
-                order: self.cfg.order(),
+                order: self.cfg.order(tb.primary),
                 button_size: self.cfg.button_size,
                 seek_size: self.cfg.seek_size,
             };
@@ -687,6 +714,8 @@ impl App {
             }
         }
 
+        self.update_card();
+
         // Run the fast timer only while some visible title needs to scroll.
         let scrolling = self.cfg.scroll_titles
             && self.widgets.iter().any(|w| w.visible && !w.params.mini && w.overflow > 0.0);
@@ -700,6 +729,105 @@ impl App {
                 }
             }
         }
+    }
+
+    fn hide_card(&mut self) {
+        if self.card_visible {
+            self.card_visible = false;
+            unsafe {
+                let _ = ShowWindow(self.card, SW_HIDE);
+            }
+        }
+    }
+
+    /// Show the hover card once the mouse has rested on a widget for a
+    /// moment; hide it when the mouse leaves.
+    fn update_card(&mut self) {
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let over = self.widgets.iter().position(|w| {
+            let (x, y, width, height) = w.rect;
+            w.visible && !w.dragging && pt.x >= x && pt.x < x + width && pt.y >= y && pt.y < y + height
+        });
+        let allowed = self.cfg.hover_card && self.snap.active && !MENU_OPEN.load(Ordering::Relaxed);
+        if over.is_none() {
+            self.card_dismissed = false;
+        }
+        let Some(i) = over.filter(|_| allowed && !self.card_dismissed) else {
+            self.hover_since = None;
+            self.hide_card();
+            return;
+        };
+        match self.hover_since {
+            Some((widget, _)) if widget == i => {}
+            _ => self.hover_since = Some((i, Instant::now())),
+        }
+        let rested = self.hover_since.is_some_and(|(_, since)| since.elapsed() >= Duration::from_millis(650));
+        if !rested || self.widgets[i].pressed != Hit::None {
+            self.hide_card();
+            return;
+        }
+
+        let scale = self.widgets[i].params.scale.max(0.5);
+        let (w, h) = render::card_size(scale);
+        let status = {
+            let app = launch::display_name(&self.snap.app_id);
+            let state = if self.snap.playing { "Playing" } else { "Paused" };
+            if self.has_timeline() {
+                format!("{app}  \u{00B7}  {state}  \u{00B7}  {}", format_time(self.snap.end - self.snap.start))
+            } else {
+                format!("{app}  \u{00B7}  {state}")
+            }
+        };
+        let frame = Card {
+            w,
+            h,
+            scale,
+            smooth: self.cfg.smooth,
+            light: self.system_light,
+            font: self.cfg.font,
+            title: self.snap.title.clone(),
+            artist: self.snap.artist.clone(),
+            album: self.snap.album.clone(),
+            status,
+            art_gen: self.snap.art_gen,
+            has_art: self.snap.art.is_some(),
+        };
+
+        // Centred above the widget (below it for a taskbar at the top),
+        // kept on the widget's monitor.
+        let (wx, wy, ww, wh) = self.widgets[i].rect;
+        let gap = (8.0 * scale) as i32;
+        let (mut x, mut y) = (wx + ww / 2 - w / 2, wy - h - gap);
+        unsafe {
+            let monitor = MonitorFromWindow(self.widgets[i].hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                let m = mi.rcMonitor;
+                if y < m.top {
+                    y = wy + wh + gap;
+                }
+                x = x.min(m.right - w - gap).max(m.left + gap);
+            }
+            if self.card_frame.as_ref() != Some(&frame) {
+                let art = self.snap.art.clone();
+                let spotify = self.snap.app_id.to_lowercase().contains("spotify");
+                render::paint_card(self.card, &frame, art.as_deref().map(|v| v.as_slice()), spotify);
+                self.card_frame = Some(frame);
+            }
+            let _ = SetWindowPos(
+                self.card,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        self.card_visible = true;
     }
 
     /// Advance scrolling titles.
@@ -768,7 +896,8 @@ impl App {
             h,
             params: widget.params,
             smooth: self.cfg.smooth,
-            light: !self.light_text_on_dark(),
+            light: self.text_color().1,
+            fg: self.text_color().0,
             title: line1,
             artist: inline,
             below,
@@ -792,8 +921,9 @@ impl App {
             shuffle: self.snap.shuffle,
             can_repeat: self.snap.can_repeat,
             repeat: self.snap.repeat,
-            accent: self.cfg.accent_mode,
-            accent_rgb: self.system_accent,
+            // Windows' accent and a custom color are both a fixed color.
+            accent: if self.cfg.accent_mode == 3 { 1 } else { self.cfg.accent_mode },
+            accent_rgb: if self.cfg.accent_mode == 3 { self.cfg.accent_rgb } else { self.system_accent },
             art_shape: self.cfg.art_shape,
             background: self.cfg.background,
             font: self.cfg.font,
@@ -852,11 +982,16 @@ impl App {
             widget.pressed = Hit::None;
         }
         self.repaint(i);
+        self.hover_since = None;
+        self.card_dismissed = false;
+        self.hide_card();
     }
 
     fn mouse_down(&mut self, i: usize, x: i32, y: i32) {
         let hit = self.hit(i, x, y);
         let can_seek = self.snap.can_seek;
+        self.card_dismissed = true;
+        self.hide_card();
         let widget = &mut self.widgets[i];
         widget.hover = hit;
         widget.pressed = hit;
@@ -1056,6 +1191,7 @@ unsafe fn track_menu(menu: HMENU, hwnd: HWND) -> usize {
     let _ = GetCursorPos(&mut pt);
     // Required so the menu closes when the user clicks elsewhere.
     let _ = SetForegroundWindow(hwnd);
+    MENU_OPEN.store(true, Ordering::Relaxed);
     let choice = TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
@@ -1065,6 +1201,7 @@ unsafe fn track_menu(menu: HMENU, hwnd: HWND) -> usize {
         hwnd,
         None,
     );
+    MENU_OPEN.store(false, Ordering::Relaxed);
     let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
     let _ = DestroyMenu(menu);
     choice.0 as usize
@@ -1252,6 +1389,10 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     }
 }
 
+unsafe extern "system" fn card_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
 unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER => {
@@ -1322,7 +1463,16 @@ fn main() {
             lpszClassName: w!("TaskbarMediaController"),
             ..Default::default()
         };
-        if RegisterClassW(&widget_class) == 0 || RegisterClassW(&controller_class) == 0 {
+        let card_class = WNDCLASSW {
+            lpfnWndProc: Some(card_proc),
+            hInstance: module,
+            lpszClassName: w!("TaskbarMediaCard"),
+            ..Default::default()
+        };
+        if RegisterClassW(&widget_class) == 0
+            || RegisterClassW(&controller_class) == 0
+            || RegisterClassW(&card_class) == 0
+        {
             return;
         }
         settings::register_class(module);
@@ -1349,6 +1499,23 @@ fn main() {
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
         probe::spawn();
 
+        // The hover card: never takes focus, and clicks pass through it.
+        let card = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
+            w!("TaskbarMediaCard"),
+            w!("Taskbar Media"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(module),
+            None,
+        )
+        .unwrap_or_default();
+
         let cfg = Config::load();
         media::SPOTIFY_ONLY.store(cfg.spotify_only, Ordering::Relaxed);
         update::ENABLED.store(cfg.check_updates, Ordering::Relaxed);
@@ -1369,6 +1536,11 @@ fn main() {
                 tray_shown: false,
                 tray_tip: String::new(),
                 anim_on: false,
+                card,
+                card_frame: None,
+                card_visible: false,
+                hover_since: None,
+                card_dismissed: false,
                 can_reserve: reserve::supported(),
                 shared,
                 tx,

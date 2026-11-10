@@ -5,6 +5,14 @@ notification area (tray icons and clock).
 
 ![Taskbar Media on a dark and a light taskbar](docs/preview.png)
 
+Rest the mouse on it for a closer look at what is playing:
+
+![The hover card](docs/card.png)
+
+Nearly everything can be rearranged, hidden or restyled:
+
+![Five example layouts](docs/layouts.png)
+
 From left to right:
 
 - A small settings button
@@ -34,17 +42,19 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 
 ## Settings
 
-<img src="docs/settings.png" alt="The settings window" width="456">
+<img src="docs/settings.png" alt="The Layout tab of the settings window" width="456">
 
 - **General**: start with Windows, hide while paused, tray icon, update
   check, Spotify only, which taskbars to show on, keep clear of app icons
-- **Layout**: which items show and in what order, text width, button size,
-  and what the text shows
+- **Layout**: which items show and in what order (with the title and seek
+  bar stacked, side by side, or on their own), a separate layout for other
+  displays, text width, button size, and what the text shows
 - **Appearance**: text size, font, text color, rendering (smooth or sharp),
-  highlight color, album art shape, seek bar thickness, background, times,
-  scrolling titles
+  highlight color, custom colors, album art shape, seek bar thickness,
+  background, times, scrolling titles, hover card
 - **Behavior**: what the mouse wheel, a click on the album art, a click on
   the title, and the output device button do
+- **More**: export, import or reset all settings; version and releases
 
 Requires Windows 10 (1809 or later) or Windows 11, 64-bit, with the taskbar at
 the bottom or top of the screen. Taskbars on other displays exist only when
@@ -74,6 +84,12 @@ attaches a freshly built `TaskbarMedia.exe` to it.
 
 Settings live in `HKCU\Software\TaskbarMedia`; "Start with Windows" adds a
 value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+
+## About the screenshots
+
+The pictures on this page are drawn from the widget's layout code with an
+invented track, not captured from a running PC, so fonts and spacing can
+differ slightly from the real thing.
 
 ## License
 

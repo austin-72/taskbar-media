@@ -6,7 +6,12 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::core::{w, BOOL, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::UI::Controls::Dialogs::{
+    ChooseColorW, GetOpenFileNameW, GetSaveFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
+    OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, EnumDisplayMonitors, GetMonitorInfoW, GetSysColorBrush, MonitorFromPoint,
     COLOR_3DFACE, HDC, HFONT, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
@@ -48,6 +53,14 @@ const ID_TITLE_CLICK: i32 = 135;
 const ID_OUTPUT_CLICK: i32 = 136;
 const ID_OUTPUT_A: i32 = 137;
 const ID_OUTPUT_B: i32 = 138;
+const ID_LAYOUT_TARGET: i32 = 139;
+const ID_LAYOUT2: i32 = 107;
+const ID_HOVER: i32 = 108;
+const ID_TEXT_RGB: i32 = 124;
+const ID_ACCENT_RGB: i32 = 125;
+const ID_EXPORT: i32 = 126;
+const ID_IMPORT: i32 = 127;
+const ID_RESET_ALL: i32 = 128;
 // Buttons.
 const ID_RESET_POS: i32 = 120;
 const ID_CLOSE: i32 = 121;
@@ -73,6 +86,7 @@ const LB_SETCURSEL: u32 = 0x0186;
 const LB_GETCURSEL: u32 = 0x0188;
 const TCM_GETCURSEL: u32 = 0x130B;
 const TCM_INSERTITEMW: u32 = 0x133E;
+const TCM_SETCURSEL: u32 = 0x130C;
 const TCN_SELCHANGE: u32 = -551i32 as u32;
 const BS_AUTOCHECKBOX: u32 = 0x0003;
 const BS_DEFPUSHBUTTON: u32 = 0x0001;
@@ -88,7 +102,7 @@ const CLIENT_W: i32 = 400;
 const TOP: i32 = 48;
 const BUTTONS_Y: i32 = 482;
 const CLIENT_H: i32 = BUTTONS_Y + 28 + 14;
-const TAB_NAMES: [&str; 4] = ["General", "Layout", "Appearance", "Behavior"];
+const TAB_NAMES: [&str; 5] = ["General", "Layout", "Appearance", "Behavior", "More"];
 
 /// Controls created with this tab index are always visible.
 const NO_TAB: usize = usize::MAX;
@@ -101,6 +115,12 @@ thread_local! {
     /// Device ids behind the rows of the two output-device lists (row 0 is
     /// "not set").
     static OUTPUTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Which layout the Layout tab is editing: 0 main taskbar, 1 the others.
+    /// The tab to show when the window next opens.
+    static START_TAB: Cell<usize> = const { Cell::new(0) };
+    static LAYOUT_TARGET: Cell<usize> = const { Cell::new(0) };
+    /// Colors the user saved in the color picker, kept while the app runs.
+    static CUSTOM_COLORS: RefCell<[COLORREF; 16]> = const { RefCell::new([COLORREF(0x00FF_FFFF); 16]) };
     /// Every tab's controls, as (tab index, window handle).
     static PAGES: RefCell<Vec<(usize, isize)>> = const { RefCell::new(Vec::new()) };
 }
@@ -422,26 +442,20 @@ pub fn open(module: HINSTANCE) {
         y += 30;
         b.button("Reset positions", 16, y, 130, ID_RESET_POS, false);
 
-        y += 46;
-        b.header("About", y);
-        y += 24;
-        let about = match crate::update::available() {
-            Some(newer) => format!(
-                "Taskbar Media {}. Version {newer} is available.",
-                crate::update::VERSION
-            ),
-            None => format!("Taskbar Media {}", crate::update::VERSION),
-        };
-        b.text(&about, y, 20);
-        y += 24;
-        b.button("Open the releases page", 16, y, 180, ID_RELEASES, false);
-        debug_assert!(y + 28 <= BUTTONS_Y - 10);
 
         // ---- Layout -----------------------------------------------------
         b.tab.set(1);
         let mut y = TOP;
+        LAYOUT_TARGET.with(|t| t.set(0));
+        b.checkbox("Taskbars on other displays use their own layout", y, ID_LAYOUT2, cfg.layout2_on);
+        y += 28;
+        b.choice("Editing", y, ID_LAYOUT_TARGET, &["Main taskbar", "Other taskbars"], 0);
+        if let Ok(target) = GetDlgItem(Some(parent), ID_LAYOUT_TARGET) {
+            let _ = EnableWindow(target, cfg.layout2_on);
+        }
+        y += 34;
         b.text("Items on the widget, in order from left to right:", y, 20);
-        y += 24;
+        y += 22;
         b.control(
             w!("LISTBOX"),
             "",
@@ -449,22 +463,22 @@ pub fn open(module: HINSTANCE) {
             16,
             y,
             214,
-            166,
+            158,
             ID_ITEMS,
             b.font,
         );
         b.button("Move up", 242, y, 142, ID_ITEM_UP, false);
         b.button("Move down", 242, y + 32, 142, ID_ITEM_DOWN, false);
         b.button("Show / hide", 242, y + 72, 142, ID_ITEM_TOGGLE, false);
-        b.button("Reset layout", 242, y + 138, 142, ID_ITEM_RESET, false);
-        y += 174;
+        b.button("Reset layout", 242, y + 130, 142, ID_ITEM_RESET, false);
+        y += 164;
         b.text(
-            "Shuffle and repeat only appear with players that support them. With the \
-             settings button hidden, right-click the widget to get back here.",
+            "Shuffle and repeat need a player that supports them. \"Title over seek bar\" \
+             replaces the two separate items when it is shown.",
             y,
-            52,
+            36,
         );
-        y += 60;
+        y += 42;
         b.choice("Text width", y, ID_WIDTH, &["Compact", "Normal", "Wide"], cfg.width);
         y += 30;
         b.choice("Button size", y, ID_BUTTON_SIZE, &["Small", "Medium", "Large"], cfg.button_size);
@@ -494,7 +508,7 @@ pub fn open(module: HINSTANCE) {
             "Text color",
             y,
             ID_COLOR,
-            &["Automatic (match Windows)", "Light text", "Dark text"],
+            &["Automatic (match Windows)", "Light text", "Dark text", "Custom"],
             cfg.text_color,
         );
         y += 30;
@@ -510,7 +524,7 @@ pub fn open(module: HINSTANCE) {
             "Highlight color",
             y,
             ID_ACCENT,
-            &["From the album art", "Windows accent color", "Same as the text"],
+            &["From the album art", "Windows accent color", "Same as the text", "Custom"],
             cfg.accent_mode,
         );
         y += 30;
@@ -519,10 +533,15 @@ pub fn open(module: HINSTANCE) {
         b.choice("Seek bar", y, ID_SEEK_SIZE, &["Thin", "Normal", "Thick"], cfg.seek_size);
         y += 30;
         b.choice("Background", y, ID_BACKGROUND, &["None", "Subtle", "Solid"], cfg.background);
-        y += 36;
+        y += 34;
+        b.button("Custom text color...", 16, y, 180, ID_TEXT_RGB, false);
+        b.button("Custom highlight color...", 204, y, 180, ID_ACCENT_RGB, false);
+        y += 40;
         b.checkbox("Show elapsed and total time", y, ID_SHOW_TIMES, cfg.show_times);
         y += 26;
         b.checkbox("Scroll titles that are too long to fit", y, ID_SCROLL, cfg.scroll_titles);
+        y += 26;
+        b.checkbox("Show a larger card when the mouse rests on the widget", y, ID_HOVER, cfg.hover_card);
 
         // ---- Behavior ---------------------------------------------------
         b.tab.set(3);
@@ -577,12 +596,48 @@ pub fn open(module: HINSTANCE) {
         b.choice_owned("Second device", y, ID_OUTPUT_B, &names, row_of(&cfg.output_b));
         OUTPUTS.with(|v| *v.borrow_mut() = outputs.into_iter().map(|d| d.id).collect());
 
+        // ---- More --------------------------------------------------------
+        b.tab.set(4);
+        let mut y = TOP;
+        b.header("Settings file", y);
+        y += 24;
+        b.text(
+            "Save all settings to a file, load them back, or return everything to how it \
+             was when first installed.",
+            y,
+            36,
+        );
+        y += 42;
+        b.button("Export...", 16, y, 116, ID_EXPORT, false);
+        b.button("Import...", 142, y, 116, ID_IMPORT, false);
+        b.button("Reset everything", 268, y, 116, ID_RESET_ALL, false);
+
+        y += 52;
+        b.header("About", y);
+        y += 24;
+        let about = match crate::update::available() {
+            Some(newer) => format!(
+                "Taskbar Media {}. Version {newer} is available.",
+                crate::update::VERSION
+            ),
+            None => format!("Taskbar Media {}", crate::update::VERSION),
+        };
+        b.text(&about, y, 20);
+        y += 24;
+        b.button("Open the releases page", 16, y, 180, ID_RELEASES, false);
+
         // ---- Buttons ----------------------------------------------------
         b.tab.set(NO_TAB);
         b.button("Exit Taskbar Media", 16, BUTTONS_Y, 150, ID_EXIT, false);
         b.button("Close", CLIENT_W - 16 - 90, BUTTONS_Y, 90, ID_CLOSE, true);
 
         fill_items(parent, &cfg, 0);
+        // Reopened after an import or reset: come back on the same tab.
+        let start = START_TAB.with(|t| t.replace(0));
+        if start != 0 {
+            SendMessageW(tabs, TCM_SETCURSEL, Some(WPARAM(start)), Some(LPARAM(0)));
+            show_tab(start);
+        }
         let _ = ShowWindow(parent, SW_SHOWNORMAL);
         let _ = SetForegroundWindow(parent);
     }
@@ -602,12 +657,13 @@ unsafe fn show_tab(tab: usize) {
 unsafe fn fill_items(parent: HWND, cfg: &Config, select: usize) {
     let Ok(list) = GetDlgItem(Some(parent), ID_ITEMS) else { return };
     SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
-    for (item, shown) in &cfg.layout {
+    let editing = if LAYOUT_TARGET.with(|t| t.get()) == 1 { &cfg.layout2 } else { &cfg.layout };
+    for (item, shown) in editing {
         let label = config::item_label(*item);
         let text = HSTRING::from(if *shown { label.to_string() } else { format!("{label}  (hidden)") });
         SendMessageW(list, LB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(text.as_ptr() as isize)));
     }
-    let select = select.min(cfg.layout.len().saturating_sub(1));
+    let select = select.min(editing.len().saturating_sub(1));
     SendMessageW(list, LB_SETCURSEL, Some(WPARAM(select)), Some(LPARAM(0)));
 }
 
@@ -631,13 +687,90 @@ unsafe fn selection(parent: HWND, id: i32) -> usize {
 unsafe fn edit_layout(parent: HWND, edit: impl FnOnce(&mut Vec<(u8, bool)>, usize) -> usize) {
     let Ok(list) = GetDlgItem(Some(parent), ID_ITEMS) else { return };
     let row = SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
-    let mut layout = crate::current_config().layout;
+    let other = LAYOUT_TARGET.with(|t| t.get()) == 1;
+    let cfg = crate::current_config();
+    let mut layout = if other { cfg.layout2 } else { cfg.layout };
     if row < 0 || row as usize >= layout.len() {
         return;
     }
     let select = edit(&mut layout, row as usize);
-    crate::update_config(|c| c.layout = layout);
+    crate::update_config(|c| {
+        if other {
+            c.layout2 = layout;
+        } else {
+            c.layout = layout;
+        }
+    });
     fill_items(parent, &crate::current_config(), select);
+}
+
+/// Select a row of a drop-down list.
+unsafe fn select_row(parent: HWND, id: i32, row: usize) {
+    if let Ok(h) = GetDlgItem(Some(parent), id) {
+        SendMessageW(h, CB_SETCURSEL, Some(WPARAM(row)), Some(LPARAM(0)));
+    }
+}
+
+unsafe fn message(parent: HWND, text: &str) {
+    MessageBoxW(Some(parent), &HSTRING::from(text), w!("Taskbar Media"), MB_OK | MB_ICONWARNING);
+}
+
+/// The Windows color picker, starting from `current` (0xAARRGGBB). Returns
+/// the chosen color, or None if cancelled.
+unsafe fn pick_color(parent: HWND, current: u32) -> Option<u32> {
+    // COLORREF is 0x00BBGGRR.
+    let swap = |c: u32| ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF);
+    let mut custom = CUSTOM_COLORS.with(|c| *c.borrow());
+    let mut dialog = CHOOSECOLORW {
+        lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: parent,
+        rgbResult: COLORREF(swap(current)),
+        lpCustColors: custom.as_mut_ptr(),
+        Flags: CC_RGBINIT | CC_FULLOPEN,
+        ..Default::default()
+    };
+    let chosen = ChooseColorW(&mut dialog).as_bool();
+    CUSTOM_COLORS.with(|c| *c.borrow_mut() = custom);
+    chosen.then(|| 0xFF00_0000 | swap(dialog.rgbResult.0))
+}
+
+/// Ask where to save (or which file to open). Returns the chosen path.
+unsafe fn file_dialog(parent: HWND, save: bool) -> Option<String> {
+    let mut path = [0u16; 1024];
+    let default_name: Vec<u16> = "TaskbarMedia-settings.txt".encode_utf16().collect();
+    if save {
+        path[..default_name.len()].copy_from_slice(&default_name);
+    }
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: parent,
+        lpstrFilter: w!("Settings files (*.txt)\0*.txt\0All files\0*.*\0"),
+        lpstrFile: PWSTR(path.as_mut_ptr()),
+        nMaxFile: path.len() as u32,
+        lpstrDefExt: w!("txt"),
+        Flags: if save {
+            OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+        } else {
+            OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR
+        },
+        ..Default::default()
+    };
+    let ok = if save { GetSaveFileNameW(&mut dialog) } else { GetOpenFileNameW(&mut dialog) };
+    if !ok.as_bool() {
+        return None;
+    }
+    let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+    Some(String::from_utf16_lossy(&path[..len]))
+}
+
+/// Apply settings that were just imported or reset, and rebuild the window
+/// so that every control shows the new values.
+unsafe fn reopen(hwnd: HWND) {
+    crate::reload_config();
+    let module = HINSTANCE(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) as *mut c_void);
+    START_TAB.with(|t| t.set(4));
+    let _ = DestroyWindow(hwnd);
+    open(module);
 }
 
 unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
@@ -756,6 +889,81 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             0
         }),
         (ID_ITEMS, LBN_SELCHANGE) => {}
+        (ID_LAYOUT2, BN_CLICKED) => {
+            // Turning it on starts the other taskbars from the main layout's
+            // current state and switches the editor to them.
+            let on = checked(hwnd, id);
+            crate::update_config(|c| {
+                if on && !c.layout2_on {
+                    c.layout2 = c.layout.clone();
+                }
+                c.layout2_on = on;
+            });
+            LAYOUT_TARGET.with(|t| t.set(usize::from(on)));
+            if let Ok(target) = GetDlgItem(Some(hwnd), ID_LAYOUT_TARGET) {
+                let _ = EnableWindow(target, on);
+                SendMessageW(target, CB_SETCURSEL, Some(WPARAM(usize::from(on))), Some(LPARAM(0)));
+            }
+            fill_items(hwnd, &crate::current_config(), 0);
+        }
+        (ID_LAYOUT_TARGET, CBN_SELCHANGE) => {
+            LAYOUT_TARGET.with(|t| t.set(selection(hwnd, id).min(1)));
+            fill_items(hwnd, &crate::current_config(), 0);
+        }
+        (ID_HOVER, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.hover_card = v);
+        }
+        (ID_TEXT_RGB, BN_CLICKED) => {
+            if let Some(color) = pick_color(hwnd, crate::current_config().text_rgb) {
+                crate::update_config(|c| {
+                    c.text_rgb = color;
+                    c.text_color = 3;
+                });
+                select_row(hwnd, ID_COLOR, 3);
+            }
+        }
+        (ID_ACCENT_RGB, BN_CLICKED) => {
+            if let Some(color) = pick_color(hwnd, crate::current_config().accent_rgb) {
+                crate::update_config(|c| {
+                    c.accent_rgb = color;
+                    c.accent_mode = 3;
+                });
+                select_row(hwnd, ID_ACCENT, 3);
+            }
+        }
+        (ID_EXPORT, BN_CLICKED) => {
+            if let Some(path) = file_dialog(hwnd, true) {
+                if std::fs::write(&path, config::export_text()).is_err() {
+                    message(hwnd, "The settings file could not be written there.");
+                }
+            }
+        }
+        (ID_IMPORT, BN_CLICKED) => {
+            if let Some(path) = file_dialog(hwnd, false) {
+                let text = std::fs::read(&path)
+                    .ok()
+                    .filter(|bytes| bytes.len() <= 256 * 1024)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+                if text.is_some_and(|text| config::import_text(&text)) {
+                    reopen(hwnd);
+                } else {
+                    message(hwnd, "That file does not contain Taskbar Media settings.");
+                }
+            }
+        }
+        (ID_RESET_ALL, BN_CLICKED) => {
+            let answer = MessageBoxW(
+                Some(hwnd),
+                w!("Return every setting to its default? This cannot be undone."),
+                w!("Taskbar Media"),
+                MB_OKCANCEL | MB_ICONWARNING,
+            );
+            if answer == IDOK {
+                config::reset_all();
+                reopen(hwnd);
+            }
+        }
         (ID_RESET_POS, BN_CLICKED) => crate::update_config(|c| {
             c.offset = 0;
             c.offset2 = 0;

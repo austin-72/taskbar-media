@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.0
+
+### Added
+- "Title on its own" and "Seek bar on its own" layout items, so the title
+  and seek bar can sit side by side or be used separately.
+- A separate layout for taskbars on other displays.
+- Custom text and highlight colors, chosen with the Windows color picker.
+- Hover card: resting the mouse on the widget shows larger album art with
+  the title, artist, album and player. Can be turned off.
+- Export and import of all settings as a file, and "Reset everything".
+
+### Changed
+- The settings window has a fifth tab, More, holding the settings file
+  buttons and the About section.
+- README screenshots redrawn from the widget's actual layout code.
+
 ## 1.3.0
 
 ### Added

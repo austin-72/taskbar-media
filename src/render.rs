@@ -19,7 +19,7 @@ use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
 use crate::config::{
-    FONTS, ITEM_COUNT, ITEM_OUTPUT, ITEM_ART, ITEM_GEAR, ITEM_INFO, ITEM_NEXT, ITEM_PLAY, ITEM_PREV, ITEM_REPEAT,
+    FONTS, ITEM_COUNT, ITEM_OUTPUT, ITEM_SEEK, ITEM_TITLE, ITEM_ART, ITEM_GEAR, ITEM_INFO, ITEM_NEXT, ITEM_PLAY, ITEM_PREV, ITEM_REPEAT,
     ITEM_SHUFFLE,
 };
 
@@ -113,6 +113,8 @@ pub struct Layout {
     pub extras: [Rect; 2],
     /// The output device button; zero-sized when not shown.
     pub output: Rect,
+    /// The title sits above the seek bar, rather than each on its own.
+    pub stacked: bool,
     pub row1: Rect,
     pub row2: Rect,
     pub elapsed: Rect,
@@ -149,6 +151,8 @@ impl Layout {
                 0 => false,
                 ITEM_SHUFFLE | ITEM_REPEAT => p.extra && !p.mini,
                 ITEM_INFO => !p.mini,
+                // The stacked block already has both; don't show them twice.
+                ITEM_TITLE | ITEM_SEEK => !p.mini && !p.order.contains(&ITEM_INFO),
                 _ => true,
             })
             .collect();
@@ -181,9 +185,9 @@ impl Layout {
                     x += ew;
                     end_pad = (6.0 * u).round();
                 }
-                ITEM_INFO => {
+                ITEM_INFO | ITEM_TITLE | ITEM_SEEK => {
                     x += if x > 7.0 * u { (8.0 * u).round() } else { 0.0 };
-                    x = l.place_info(p, x, h, text_w);
+                    x = l.place_text(p, x, h, text_w, item != ITEM_SEEK, item != ITEM_TITLE);
                     end_pad = (8.0 * u).round();
                 }
                 _ => {}
@@ -193,44 +197,49 @@ impl Layout {
         l
     }
 
-    /// Lay out the title row and the seek bar row starting at `tx`. Returns
-    /// the x just past them.
-    fn place_info(&mut self, p: &LayoutParams, tx: f32, h: f32, text_w: f32) -> f32 {
+    /// Lay out the title row and / or the seek bar row starting at `tx`:
+    /// stacked when both, otherwise centred on the taskbar. Returns the x
+    /// just past them.
+    fn place_text(&mut self, p: &LayoutParams, tx: f32, h: f32, text_w: f32, title: bool, seek: bool) -> f32 {
         let (u, t) = (self.u, self.t);
         let tw = (text_w * u).round();
         let row1_h = 17.0 * u * t;
         let row2_h = 13.0 * u * t;
         let gap = 1.0 * u;
+        let stacked = title && seek;
         let ty = ((h - (row1_h + gap + row2_h)) / 2.0).floor();
-        let row1 = Rect { x: tx, y: ty, w: tw, h: row1_h };
-        let row2 = Rect { x: tx, y: ty + row1_h + gap, w: tw, h: row2_h };
-
-        let label_w = if p.show_times {
-            (p.time_chars.max(4) as f32 * 5.6 + 3.0) * u * t
-        } else {
-            0.0
-        };
-        let label_gap = if p.show_times { 6.0 * u } else { 2.0 * u };
-        let total = Rect { x: tx + tw - label_w, w: label_w, ..row2 };
-        let track_h = ([2.0, 3.0, 5.0][p.seek_size.min(2) as usize] * u).round().max(2.0);
-        let track_x = tx + label_w + label_gap;
-        let track = Rect {
-            x: track_x,
-            y: (row2.cy() - track_h / 2.0).round(),
-            w: (total.x - label_gap - track_x).max(10.0),
-            h: track_h,
-        };
-        self.row1 = row1;
-        self.row2 = row2;
-        self.elapsed = Rect { w: label_w, ..row2 };
-        self.total = total;
-        self.track = track;
-        self.seek_hit = Rect {
-            x: track.x - 5.0 * u,
-            y: row2.y - 3.0 * u,
-            w: track.w + 10.0 * u,
-            h: h - (row2.y - 3.0 * u),
-        };
+        if title {
+            let y = if stacked { ty } else { ((h - row1_h) / 2.0).floor() };
+            self.row1 = Rect { x: tx, y, w: tw, h: row1_h };
+            self.stacked = stacked;
+        }
+        if seek {
+            let y = if stacked { ty + row1_h + gap } else { ((h - row2_h) / 2.0).floor() };
+            let row2 = Rect { x: tx, y, w: tw, h: row2_h };
+            let label_w = if p.show_times {
+                (p.time_chars.max(4) as f32 * 5.6 + 3.0) * u * t
+            } else {
+                0.0
+            };
+            let label_gap = if p.show_times { 6.0 * u } else { 2.0 * u };
+            let total = Rect { x: tx + tw - label_w, w: label_w, ..row2 };
+            let track_h = ([2.0, 3.0, 5.0][p.seek_size.min(2) as usize] * u).round().max(2.0);
+            let track_x = tx + label_w + label_gap;
+            let track = Rect {
+                x: track_x,
+                y: (row2.cy() - track_h / 2.0).round(),
+                w: (total.x - label_gap - track_x).max(10.0),
+                h: track_h,
+            };
+            self.row2 = row2;
+            self.elapsed = Rect { w: label_w, ..row2 };
+            self.total = total;
+            self.track = track;
+            // Stacked: from just above the bar down to the screen edge. On
+            // its own: the full height of the taskbar.
+            let top = if stacked { row2.y - 3.0 * u } else { 0.0 };
+            self.seek_hit = Rect { x: track.x - 5.0 * u, y: top, w: track.w + 10.0 * u, h: h - top };
+        }
         tx + tw
     }
 
@@ -260,7 +269,7 @@ impl Layout {
         if within(&self.output, 0.0) {
             return Hit::Output;
         }
-        if within(&self.row1, 0.0) && y < self.row2.y - 3.0 * self.u {
+        if within(&self.row1, 0.0) && (!self.stacked || y < self.row2.y - 3.0 * self.u) {
             return Hit::Title;
         }
         Hit::None
@@ -279,7 +288,10 @@ pub struct Frame {
     pub h: i32,
     pub params: LayoutParams,
     pub smooth: bool,
+    /// The taskbar is light, so shading is done with dark tints.
     pub light: bool,
+    /// Text and icon color, 0xFFRRGGBB.
+    pub fg: u32,
     /// The main text of the first row.
     pub title: String,
     /// Dimmer text after it on the same row; may be empty.
@@ -362,6 +374,101 @@ pub fn init() {
     }
 }
 
+/// Supersampling factor for smooth drawing: more on low-DPI screens, where
+/// it matters most.
+fn supersample(smooth: bool, scale: f32) -> i32 {
+    if !smooth {
+        1
+    } else if scale >= 1.75 {
+        2
+    } else {
+        3
+    }
+}
+
+/// Let `draw` paint a picture `k` times larger than `w` x `h`, average it
+/// down, and show it in the layered window `hwnd`.
+unsafe fn render_to_window<R: Default>(
+    hwnd: HWND,
+    w: i32,
+    h: i32,
+    k: i32,
+    draw: impl FnOnce(*mut GpGraphics) -> R,
+) -> R {
+    let (bw, bh) = (w * k, h * k);
+    let mut big = vec![0u32; (bw * bh) as usize];
+    let mut bitmap: *mut GpBitmap = null_mut();
+    GdipCreateBitmapFromScan0(
+        bw,
+        bh,
+        bw * 4,
+        PixelFormat32bppPARGB as i32,
+        Some(big.as_mut_ptr() as *const u8),
+        &mut bitmap,
+    );
+    if bitmap.is_null() {
+        return R::default();
+    }
+    let mut result = R::default();
+    let mut g: *mut GpGraphics = null_mut();
+    GdipGetImageGraphicsContext(bitmap as *mut GpImage, &mut g);
+    if !g.is_null() {
+        result = draw(g);
+        GdipFlush(g, FlushIntentionSync);
+        GdipDeleteGraphics(g);
+    }
+    GdipDisposeImage(bitmap as *mut GpImage);
+
+    let screen = GetDC(None);
+    let mem = CreateCompatibleDC(Some(screen));
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, // top-down
+            biPlanes: 1,
+            biBitCount: 32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut core::ffi::c_void = null_mut();
+    if let std::result::Result::Ok(dib) =
+        CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+    {
+        if !bits.is_null() {
+            let out = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
+            downsample(&big, bw as usize, out, w as usize, h as usize, k as usize);
+
+            let old = SelectObject(mem, dib.into());
+            let size = SIZE { cx: w, cy: h };
+            let origin = POINT::default();
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                hwnd,
+                Some(screen),
+                None,
+                Some(&size),
+                Some(mem),
+                Some(&origin),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            SelectObject(mem, old);
+        }
+        let _ = DeleteObject(dib.into());
+    }
+    let _ = DeleteDC(mem);
+    ReleaseDC(None, screen);
+    result
+}
+
 /// Draw `f` and push it to the layered window. Returns how many pixels wider
 /// the title line is than the space for it (0 or less when it fits).
 ///
@@ -377,90 +484,114 @@ pub fn paint(
     if f.w <= 0 || f.h <= 0 {
         return 0.0;
     }
-    // Supersampling factor.
-    let k: i32 = if !f.smooth {
-        1
-    } else if f.params.scale >= 1.75 {
-        2
-    } else {
-        3
-    };
-    let (bw, bh) = (f.w * k, f.h * k);
+    let k = supersample(f.smooth, f.params.scale);
     let layout = Layout::new(&f.params.scaled(k));
-    let mut big = vec![0u32; (bw * bh) as usize];
-
     unsafe {
-        let mut bitmap: *mut GpBitmap = null_mut();
-        GdipCreateBitmapFromScan0(
-            bw,
-            bh,
-            bw * 4,
-            PixelFormat32bppPARGB as i32,
-            Some(big.as_mut_ptr() as *const u8),
-            &mut bitmap,
-        );
-        if bitmap.is_null() {
-            return 0.0;
-        }
-        let mut overflow = 0.0;
-        let mut g: *mut GpGraphics = null_mut();
-        GdipGetImageGraphicsContext(bitmap as *mut GpImage, &mut g);
-        if !g.is_null() {
-            overflow = draw(g, f, &layout, k, cache, art, spotify) / k as f32;
-            GdipFlush(g, FlushIntentionSync);
-            GdipDeleteGraphics(g);
-        }
-        GdipDisposeImage(bitmap as *mut GpImage);
-
-        let screen = GetDC(None);
-        let mem = CreateCompatibleDC(Some(screen));
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: f.w,
-                biHeight: -f.h, // top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits: *mut core::ffi::c_void = null_mut();
-        if let std::result::Result::Ok(dib) =
-            CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
-        {
-            if !bits.is_null() {
-                let out = std::slice::from_raw_parts_mut(bits as *mut u32, (f.w * f.h) as usize);
-                downsample(&big, bw as usize, out, f.w as usize, f.h as usize, k as usize);
-
-                let old = SelectObject(mem, dib.into());
-                let size = SIZE { cx: f.w, cy: f.h };
-                let origin = POINT::default();
-                let blend = BLENDFUNCTION {
-                    BlendOp: AC_SRC_OVER as u8,
-                    BlendFlags: 0,
-                    SourceConstantAlpha: 255,
-                    AlphaFormat: AC_SRC_ALPHA as u8,
-                };
-                let _ = UpdateLayeredWindow(
-                    hwnd,
-                    Some(screen),
-                    None,
-                    Some(&size),
-                    Some(mem),
-                    Some(&origin),
-                    COLORREF(0),
-                    Some(&blend),
-                    ULW_ALPHA,
-                );
-                SelectObject(mem, old);
-            }
-            let _ = DeleteObject(dib.into());
-        }
-        let _ = DeleteDC(mem);
-        ReleaseDC(None, screen);
-        overflow
+        render_to_window(hwnd, f.w, f.h, k, |g| draw(g, f, &layout, k, cache, art, spotify)) / k as f32
     }
+}
+
+/// The hover card: a larger view of the current track.
+#[derive(Clone, Default, PartialEq)]
+pub struct Card {
+    pub w: i32,
+    pub h: i32,
+    /// DPI scale of the monitor it is shown on.
+    pub scale: f32,
+    pub smooth: bool,
+    /// Light Windows theme: light card with dark text.
+    pub light: bool,
+    pub font: u32,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    /// Bottom line, for example "Spotify · Playing".
+    pub status: String,
+    pub art_gen: u64,
+    pub has_art: bool,
+}
+
+/// Size of the hover card in pixels at a DPI scale.
+pub fn card_size(scale: f32) -> (i32, i32) {
+    ((320.0 * scale).round() as i32, (112.0 * scale).round() as i32)
+}
+
+/// Draw the hover card into its layered window.
+pub fn paint_card(hwnd: HWND, c: &Card, art: Option<&[u8]>, spotify: bool) {
+    if c.w <= 0 || c.h <= 0 {
+        return;
+    }
+    let k = supersample(c.smooth, c.scale);
+    unsafe {
+        render_to_window(hwnd, c.w, c.h, k, |g| draw_card(g, c, k, art, spotify));
+    }
+}
+
+unsafe fn draw_card(g: *mut GpGraphics, c: &Card, k: i32, art: Option<&[u8]>, spotify: bool) {
+    let u = c.scale * k as f32;
+    let (w, h) = ((c.w * k) as f32, (c.h * k) as f32);
+    let fg: u32 = if c.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
+    let family = FONTS[(c.font as usize).min(FONTS.len() - 1)];
+
+    GdipGraphicsClear(g, 0x0000_0000);
+    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+    GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+    GdipSetTextRenderingHint(
+        g,
+        if k > 1 { TextRenderingHintAntiAlias } else { TextRenderingHintAntiAliasGridFit },
+    );
+
+    // Panel with a hairline border.
+    let panel = Rect { x: 0.5 * u, y: 0.5 * u, w: w - u, h: h - u };
+    fill_round_color(g, if c.light { 0xFAF6_F6F6 } else { 0xFA26_2626 }, panel, 8.0 * u);
+    let mut pen: *mut GpPen = null_mut();
+    GdipCreatePen1(alpha(fg, 0x30), 1.0 * u, UnitPixel, &mut pen);
+    if !pen.is_null() {
+        stroke_round(g, pen, panel, 8.0 * u);
+        GdipDeletePen(pen);
+    }
+
+    // Album art.
+    let pad = 12.0 * u;
+    let art_rect = Rect { x: pad, y: pad, w: h - 2.0 * pad, h: h - 2.0 * pad };
+    let bitmap = if c.has_art { art.and_then(|bytes| scale_art(bytes, art_rect.w as i32, spotify)) } else { None };
+    match bitmap {
+        Some(bitmap) => {
+            let mut tex: *mut GpTexture = null_mut();
+            GdipCreateTexture(bitmap as *mut GpImage, WrapModeClamp, &mut tex);
+            if !tex.is_null() {
+                GdipTranslateTextureTransform(tex, art_rect.x, art_rect.y, MatrixOrderAppend);
+                fill_round(g, tex as *mut GpBrush, art_rect, 6.0 * u);
+                GdipDeleteBrush(tex as *mut GpBrush);
+            }
+            GdipDisposeImage(bitmap as *mut GpImage);
+        }
+        None => {
+            fill_round_color(g, alpha(fg, 0x24), art_rect, 6.0 * u);
+            let font = make_font("Segoe UI Symbol", art_rect.h * 0.5, false);
+            let fmt = make_format(StringAlignmentCenter, true);
+            draw_text(g, "\u{266B}", font, art_rect, fmt, alpha(fg, 0x9E));
+            GdipDeleteFont(font);
+            GdipDeleteStringFormat(fmt);
+        }
+    }
+
+    // Title, artist, album, and a status line at the bottom.
+    let x = art_rect.x + art_rect.w + 14.0 * u;
+    let tw = w - x - pad;
+    let near = make_format(StringAlignmentNear, true);
+    let lines: [(&str, f32, bool, u32, f32, f32); 4] = [
+        (if c.title.is_empty() { "Unknown track" } else { &c.title }, 15.0, true, 0xFF, pad - 1.0 * u, 22.0),
+        (&c.artist, 13.0, false, 0xC8, pad + 23.0 * u, 19.0),
+        (&c.album, 12.0, false, 0x90, pad + 43.0 * u, 18.0),
+        (&c.status, 11.0, false, 0x90, h - pad - 15.0 * u, 16.0),
+    ];
+    for (text, size, bold, opacity, y, height) in lines {
+        let font = make_font(family, size * u, bold);
+        draw_text(g, text, font, Rect { x, y, w: tw, h: height * u }, near, alpha(fg, opacity));
+        GdipDeleteFont(font);
+    }
+    GdipDeleteStringFormat(near);
 }
 
 /// Box-filter `src` (k times larger each way) into `dst`. Pixels are
@@ -506,7 +637,7 @@ unsafe fn draw(
 ) -> f32 {
     let supersampled = k > 1;
     let u = l.u;
-    let fg: u32 = if f.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
+    let fg: u32 = f.fg | 0xFF00_0000;
     let primary = alpha(fg, if f.light { 0xE4 } else { 0xFF });
     let dim = alpha(fg, 0x9E);
     let disabled = alpha(fg, 0x48);
@@ -751,7 +882,7 @@ unsafe fn draw(
     }
 
     // ---- text and seek bar -------------------------------------------------
-    if l.row1.w <= 0.0 {
+    if l.row1.w <= 0.0 && l.row2.w <= 0.0 {
         return 0.0;
     }
     let ts = u * l.t;
@@ -774,10 +905,12 @@ unsafe fn draw(
     } else {
         String::new()
     };
+    let mut overflow = 0.0;
+    if l.row1.w > 0.0 {
     let unbounded = Rect { w: 100_000.0, ..l.row1 };
     let title_full = measure(g, title, title_font, unbounded, free);
     let artist_full = measure(g, &artist, body_font, unbounded, free);
-    let overflow = title_full + artist_full + 2.0 * u - l.row1.w;
+    overflow = title_full + artist_full + 2.0 * u - l.row1.w;
 
     if f.scroll && overflow > 0.0 {
         // Too long: draw it whole, shifted left, and clip to the row.
@@ -796,8 +929,11 @@ unsafe fn draw(
             draw_text(g, &artist, body_font, r, near, dim);
         }
     }
+    }
 
-    if let Some(volume) = f.volume {
+    if l.row2.w <= 0.0 {
+        // No second row on this widget.
+    } else if let Some(volume) = f.volume {
         // Brief volume read-out in place of the seek bar.
         let label_w = 34.0 * ts;
         let label = Rect { x: l.row2.x + l.row2.w - label_w, w: label_w, ..l.row2 };
