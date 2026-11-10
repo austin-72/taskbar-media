@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.1
+
+### Fixed
+- The widget no longer draws over full-screen video in a browser.
+- The widget no longer stays hidden behind the taskbar after leaving
+  full-screen.
+
 ## 1.4.0
 
 ### Added

@@ -324,36 +324,84 @@ fn wanted_taskbars(cfg: &Config) -> Vec<Taskbar> {
     }
 }
 
-/// True while a full-screen app (game, video, slideshow) is in front on the
-/// taskbar's monitor, which is when the taskbar gets out of the way.
-fn fullscreen_app_running(taskbar: HWND) -> bool {
+fn is_shell_or_own_window(hwnd: HWND) -> bool {
+    let mut class = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, &mut class) }.max(0) as usize;
+    let class = String::from_utf16_lossy(&class[..n]);
+    matches!(
+        class.as_str(),
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "TaskbarMediaWidget"
+            | "TaskbarMediaCard"
+    )
+}
+
+fn covers_monitor(window: HWND, monitor_of: HWND) -> bool {
     unsafe {
-        let fg = GetForegroundWindow();
-        if fg.is_invalid() || fg == taskbar {
-            return false;
-        }
-        let mut class = [0u16; 64];
-        let n = GetClassNameW(fg, &mut class).max(0) as usize;
-        let class = String::from_utf16_lossy(&class[..n]);
-        if matches!(
-            class.as_str(),
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "TaskbarMediaWidget"
-        ) {
-            return false;
-        }
-        let Some(wr) = window_rect(fg) else { return false };
-        let monitor = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
+        let Some(wr) = window_rect(window) else { return false };
+        let monitor = MonitorFromWindow(monitor_of, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
             return false;
         }
         let m = mi.rcMonitor;
-        let covers = wr.left <= m.left && wr.top <= m.top && wr.right >= m.right && wr.bottom >= m.bottom;
-        // A maximised window also covers the monitor when the taskbar is set
-        // to auto-hide, so ask the shell whether it really is full-screen.
-        covers
+        wr.left <= m.left && wr.top <= m.top && wr.right >= m.right && wr.bottom >= m.bottom
+    }
+}
+
+/// True while something full-screen (a game, a video, a slideshow) is
+/// covering this taskbar, which is when the widget must get out of the way
+/// too.
+fn fullscreen_over(tb: &Taskbar) -> bool {
+    unsafe {
+        // The direct test: look at a spot in the taskbar's clock area. If
+        // the window showing there is not the taskbar but one that fills the
+        // whole monitor, the taskbar is covered. This catches browser video,
+        // which the shell does not report as full-screen.
+        let scale = tb.dpi as f32 / 96.0;
+        let probe = POINT {
+            x: (tb.anchor + (12.0 * scale) as i32).min(tb.rect.right - 3).max(tb.rect.left),
+            y: (tb.rect.top + tb.rect.bottom) / 2,
+        };
+        let at_probe = GetAncestor(WindowFromPoint(probe), GA_ROOT);
+        if !at_probe.is_invalid()
+            && at_probe != tb.hwnd
+            && !is_shell_or_own_window(at_probe)
+            && covers_monitor(at_probe, tb.hwnd)
+        {
+            return true;
+        }
+
+        // And what the shell itself reports (exclusive full-screen games).
+        // A maximised window also fills the monitor when the taskbar
+        // auto-hides, hence asking the shell rather than trusting the size.
+        let fg = GetForegroundWindow();
+        !fg.is_invalid()
+            && fg != tb.hwnd
+            && !is_shell_or_own_window(fg)
+            && covers_monitor(fg, tb.hwnd)
             && SHQueryUserNotificationState()
                 .is_ok_and(|s| s == QUNS_BUSY || s == QUNS_RUNNING_D3D_FULL_SCREEN)
+    }
+}
+
+/// True if `taskbar` has ended up in front of `widget`. The widget is meant
+/// to sit directly above the taskbar, but the shell re-raises the taskbar at
+/// times (leaving full-screen is one) and can leave the widget underneath.
+fn taskbar_in_front(widget: HWND, taskbar: HWND) -> bool {
+    unsafe {
+        let mut above = GetWindow(widget, GW_HWNDPREV);
+        for _ in 0..500 {
+            match above {
+                Ok(h) if h == taskbar => return true,
+                Ok(h) if !h.is_invalid() => above = GetWindow(h, GW_HWNDPREV),
+                _ => return false,
+            }
+        }
+        false
     }
 }
 
@@ -618,7 +666,7 @@ impl App {
                 || tb_w <= tb_h
                 || tb_h < 16
                 || taskbar_hidden(&tb)
-                || fullscreen_app_running(tb.hwnd)
+                || fullscreen_over(&tb)
             {
                 self.widgets[i].set_visible(false);
                 continue;
@@ -705,6 +753,20 @@ impl App {
             }
             self.repaint(i);
             self.widgets[i].set_visible(true);
+            // Put the widget back on top if the taskbar got in front of it.
+            if taskbar_in_front(self.widgets[i].hwnd, tb.hwnd) {
+                unsafe {
+                    let _ = SetWindowPos(
+                        self.widgets[i].hwnd,
+                        Some(HWND_TOPMOST),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
         }
         if self.can_reserve && !reserved {
             if let Some(main) = bars.iter().find(|b| b.primary) {

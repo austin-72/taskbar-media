@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "taskbar-media"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "embed-resource",
  "windows",
