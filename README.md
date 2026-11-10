@@ -9,8 +9,8 @@ From left to right:
 
 - A small settings button
 - Album art; click it to bring up the app that is playing
-- Previous, play/pause, next, plus shuffle and repeat when the player
-  supports them
+- Shuffle, previous, play/pause, next, repeat (shuffle and repeat only when
+  the player supports them)
 - Title and artist over a seek bar with elapsed / total time (click or drag)
 
 It uses Windows' own media session API, so it works with anything that shows

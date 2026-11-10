@@ -83,7 +83,8 @@ impl LayoutParams {
 }
 
 /// Where everything sits, in pixels relative to the widget. From the left:
-/// settings gear, album art, transport buttons, then title over the seek bar.
+/// settings gear, album art, shuffle, transport buttons, repeat, then title
+/// over the seek bar.
 #[derive(Clone, Default, PartialEq)]
 pub struct Layout {
     pub width: f32,
@@ -125,22 +126,24 @@ impl Layout {
             h: art_size,
         };
 
-        let bw = (28.0 * u).round();
-        let bh = art_size.min(32.0 * u).round();
-        let bx = art.x + art.w + (6.0 * u).round();
-        let by = ((h - bh) / 2.0).round();
-        let buttons = [0.0, 1.0, 2.0].map(|i| Rect { x: bx + i * bw, y: by, w: bw, h: bh });
-
+        // Shuffle, then previous / play-pause / next, then repeat. The two
+        // outer buttons are only there when the player supports them.
         let extra = p.extra && !p.mini;
         let ew = if extra { (23.0 * u).round() } else { 0.0 };
-        let ex = bx + 3.0 * bw + if extra { (2.0 * u).round() } else { 0.0 };
+        let bw = (28.0 * u).round();
+        let bh = art_size.min(32.0 * u).round();
+        let by = ((h - bh) / 2.0).round();
+        let sx = art.x + art.w + (6.0 * u).round();
+        let bx = sx + ew;
+        let buttons = [0.0, 1.0, 2.0].map(|i| Rect { x: bx + i * bw, y: by, w: bw, h: bh });
+        let rx = bx + 3.0 * bw;
         let extras = if extra {
-            [0.0, 1.0].map(|i| Rect { x: ex + i * ew, y: by, w: ew, h: bh })
+            [sx, rx].map(|x| Rect { x, y: by, w: ew, h: bh })
         } else {
             [Rect::default(); 2]
         };
 
-        let tx = ex + 2.0 * ew + (8.0 * u).round();
+        let tx = rx + ew + (8.0 * u).round();
         if p.mini {
             return Layout {
                 width: bx + 3.0 * bw + (6.0 * u).round(),
