@@ -14,11 +14,13 @@
 mod config;
 mod launch;
 mod media;
+mod probe;
 mod render;
 mod settings;
+mod tray;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,7 +40,9 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_SHIFT,
+    GetKeyState, ReleaseCapture, SendInput, SetCapture, TrackMouseEvent, INPUT, INPUT_0,
+    INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT,
+    VK_SHIFT, VK_VOLUME_DOWN, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
@@ -52,11 +56,16 @@ use render::{ArtCache, Frame, Hit, Layout, LayoutParams};
 const WM_APP_UPDATE: u32 = WM_APP + 1;
 const TIMER_ID: usize = 1;
 const TICK_MS: u32 = 200;
+/// Fast timer that only runs while a title is scrolling.
+const ANIM_TIMER_ID: usize = 2;
+const ANIM_MS: u32 = 33;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WIDGET_CLASS: PCWSTR = w!("TaskbarMediaWidget");
 
 /// The controller window, which the media worker posts updates to.
 static CONTROLLER_HWND: AtomicIsize = AtomicIsize::new(0);
+/// The "TaskbarCreated" message Explorer broadcasts when it (re)starts.
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -96,6 +105,8 @@ struct Taskbar {
     rect: RECT,
     /// Left edge of the tray / clock area; the widget ends just before it.
     anchor: i32,
+    /// False when `anchor` is only an estimate.
+    anchor_exact: bool,
     dpi: u32,
     primary: bool,
 }
@@ -116,10 +127,19 @@ struct Widget {
     dragging: bool,
     drag_fraction: f32,
     tracking_leave: bool,
+    /// How much wider the title line is than its space (0 or less: it fits).
+    overflow: f32,
+    /// The text `scroll_start` belongs to.
+    scroll_key: String,
+    scroll_start: Instant,
 }
 
 struct App {
     module: HINSTANCE,
+    controller: HWND,
+    tray_shown: bool,
+    tray_tip: String,
+    anim_on: bool,
     shared: Arc<Mutex<Snapshot>>,
     tx: Sender<Cmd>,
     snap: Snapshot,
@@ -156,14 +176,68 @@ fn describe_taskbar(hwnd: HWND, primary: bool) -> Option<Taskbar> {
     };
     let scale = dpi as f32 / 96.0;
     // The main taskbar has a real notification-area window. Windows 10's
-    // extra taskbars have a clock window. Windows 11's extra taskbars draw
-    // their clock without a window of its own, so its width is estimated
-    // (Shift + mouse wheel nudges the widget if the estimate is off).
-    let anchor = child_rect(hwnd, w!("TrayNotifyWnd"))
+    // extra taskbars have a clock window. Windows 11's extra taskbars have
+    // neither; there the position comes from `probe`, or failing that from
+    // this estimate (Shift + mouse wheel nudges the widget if it is off).
+    let exact = child_rect(hwnd, w!("TrayNotifyWnd"))
         .or_else(|| child_rect(hwnd, w!("ClockButton")))
-        .map(|r| r.left)
-        .unwrap_or(rect.right - ((if primary { 240.0 } else { 130.0 }) * scale) as i32);
-    Some(Taskbar { hwnd, rect, anchor, dpi, primary })
+        .map(|r| r.left);
+    let estimate = rect.right - ((if primary { 240.0 } else { 130.0 }) * scale) as i32;
+    Some(Taskbar {
+        hwnd,
+        rect,
+        anchor: exact.unwrap_or(estimate),
+        anchor_exact: exact.is_some(),
+        dpi,
+        primary,
+    })
+}
+
+/// True when the taskbar has slid (mostly) off its screen, as an auto-hiding
+/// taskbar does.
+fn taskbar_hidden(tb: &Taskbar) -> bool {
+    unsafe {
+        let monitor = MonitorFromWindow(tb.hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            return false;
+        }
+        let visible = tb.rect.bottom.min(mi.rcMonitor.bottom) - tb.rect.top.max(mi.rcMonitor.top);
+        visible < (tb.rect.bottom - tb.rect.top) / 2
+    }
+}
+
+/// Press and release a volume key, as a keyboard's volume buttons would.
+fn volume_step(up: bool) {
+    let vk = if up { VK_VOLUME_UP } else { VK_VOLUME_DOWN };
+    let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+        },
+    };
+    unsafe {
+        SendInput(&[key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// Where a too-long title is in its scroll cycle: wait, scroll to the end,
+/// wait, scroll back.
+fn marquee_offset(overflow: f32, elapsed: f32, speed: f32) -> i32 {
+    const HOLD_START: f32 = 2.5;
+    const HOLD_END: f32 = 1.8;
+    let travel = overflow / speed;
+    let t = elapsed % (HOLD_START + travel + HOLD_END + travel);
+    let fraction = if t < HOLD_START {
+        0.0
+    } else if t < HOLD_START + travel {
+        (t - HOLD_START) / travel
+    } else if t < HOLD_START + travel + HOLD_END {
+        1.0
+    } else {
+        1.0 - (t - HOLD_START - travel - HOLD_END) / travel
+    };
+    (fraction * overflow).round() as i32
 }
 
 fn monitor_device(hwnd: HWND) -> String {
@@ -338,8 +412,38 @@ impl App {
         }
     }
 
+    fn tray_tooltip(&self) -> String {
+        if !self.snap.active || self.snap.title.is_empty() {
+            "Taskbar Media".to_string()
+        } else if self.snap.artist.is_empty() {
+            self.snap.title.clone()
+        } else {
+            format!("{} - {}", self.snap.title, self.snap.artist)
+        }
+    }
+
+    /// Add, remove or relabel the tray icon to match the settings and track.
+    /// `force` re-adds it, for after Explorer restarts and forgets it.
+    fn sync_tray(&mut self, force: bool) {
+        let tip = self.tray_tooltip();
+        if !self.cfg.tray_icon {
+            if self.tray_shown {
+                tray::remove(self.controller);
+                self.tray_shown = false;
+            }
+        } else if !self.tray_shown || force {
+            tray::add(self.controller, self.module, &tip);
+            self.tray_shown = true;
+            self.tray_tip = tip;
+        } else if tip != self.tray_tip {
+            tray::update_tip(self.controller, &tip);
+            self.tray_tip = tip;
+        }
+    }
+
     fn apply_config(&mut self) {
         media::SPOTIFY_ONLY.store(self.cfg.spotify_only, Ordering::Relaxed);
+        self.sync_tray(false);
         for w in &mut self.widgets {
             w.last_frame = None;
         }
@@ -393,6 +497,9 @@ impl App {
                 dragging: false,
                 drag_fraction: 0.0,
                 tracking_leave: false,
+                overflow: 0.0,
+                scroll_key: String::new(),
+                scroll_start: Instant::now(),
             });
         }
     }
@@ -435,30 +542,70 @@ impl App {
             let tb_w = tb.rect.right - tb.rect.left;
             let tb_h = tb.rect.bottom - tb.rect.top;
             // Only horizontal taskbars (bottom or top of the screen).
-            if !showable || tb_w <= tb_h || tb_h < 16 || fullscreen_app_running(tb.hwnd) {
+            if !showable
+                || tb_w <= tb_h
+                || tb_h < 16
+                || taskbar_hidden(&tb)
+                || fullscreen_app_running(tb.hwnd)
+            {
                 self.widgets[i].set_visible(false);
                 continue;
             }
 
             let scale = tb.dpi as f32 / 96.0;
-            let params = LayoutParams {
+            let measured = probe::get(tb.hwnd);
+            let anchor = if tb.anchor_exact {
+                tb.anchor
+            } else {
+                // Believe the measurement only if it is in the right-hand half.
+                measured
+                    .tray_left
+                    .filter(|x| *x > tb.rect.left + tb_w / 2 && *x < tb.rect.right)
+                    .unwrap_or(tb.anchor)
+            };
+            let offset = if tb.primary { self.cfg.offset } else { self.cfg.offset2 };
+            let right = anchor - (2.0 * scale) as i32 + offset;
+
+            // The space between the last app button and the tray, if known.
+            let room = measured
+                .apps_right
+                .filter(|x| self.cfg.avoid_apps && *x > tb.rect.left && *x < right)
+                .map(|x| (right - x) as f32 - 8.0 * scale);
+
+            // Use the chosen width, or the widest smaller one that fits.
+            let base = LayoutParams {
                 height: tb_h,
                 scale,
                 time_chars,
                 text_size: self.cfg.text_size,
                 width: self.cfg.width,
                 show_times: self.cfg.show_times,
+                mini: false,
             };
-            let offset = if tb.primary { self.cfg.offset } else { self.cfg.offset2 };
+            let mut params = base;
+            let mut layout = Layout::new(&params);
+            if let Some(room) = room {
+                let mut width = self.cfg.width;
+                while layout.width > room {
+                    if width > 0 {
+                        width -= 1;
+                        params = LayoutParams { width, ..base };
+                    } else if !params.mini {
+                        params = LayoutParams { width: 0, mini: true, ..base };
+                    } else {
+                        break;
+                    }
+                    layout = Layout::new(&params);
+                }
+            }
+
             let widget = &mut self.widgets[i];
             if widget.params != params {
                 widget.params = params;
-                widget.layout = Layout::new(&params);
+                widget.layout = layout;
             }
             let w = widget.layout.width.ceil() as i32;
-            let x = (tb.anchor - w - (2.0 * scale) as i32 + offset)
-                .min(tb.rect.right - w)
-                .max(tb.rect.left);
+            let x = (right - w).min(tb.rect.right - w).max(tb.rect.left);
             let rect = (x, tb.rect.top, w, tb_h);
             if rect != widget.rect {
                 unsafe {
@@ -478,6 +625,29 @@ impl App {
             self.repaint(i);
             self.widgets[i].set_visible(true);
         }
+
+        // Run the fast timer only while some visible title needs to scroll.
+        let scrolling = self.cfg.scroll_titles
+            && self.widgets.iter().any(|w| w.visible && !w.params.mini && w.overflow > 0.0);
+        if scrolling != self.anim_on {
+            self.anim_on = scrolling;
+            unsafe {
+                if scrolling {
+                    SetTimer(Some(self.controller), ANIM_TIMER_ID, ANIM_MS, None);
+                } else {
+                    let _ = KillTimer(Some(self.controller), ANIM_TIMER_ID);
+                }
+            }
+        }
+    }
+
+    /// Advance scrolling titles.
+    fn animate(&mut self) {
+        for i in 0..self.widgets.len() {
+            if self.widgets[i].visible && self.widgets[i].overflow > 0.0 {
+                self.repaint(i);
+            }
+        }
     }
 
     /// Redraw widget `i` if anything visible changed since its last frame.
@@ -488,6 +658,23 @@ impl App {
         }
         let has_timeline = self.has_timeline();
         let duration = (self.snap.end - self.snap.start).max(1);
+
+        // Title scrolling: restart the cycle whenever the text changes.
+        let scroll = self.cfg.scroll_titles && !self.widgets[i].params.mini;
+        let key = format!("{}\u{1}{}", self.snap.title, self.snap.artist);
+        let widget = &mut self.widgets[i];
+        if widget.scroll_key != key {
+            widget.scroll_key = key;
+            widget.scroll_start = Instant::now();
+            widget.overflow = 0.0;
+        }
+        let scroll_px = if scroll && widget.overflow > 0.0 {
+            let speed = 28.0 * widget.params.scale.max(0.5);
+            marquee_offset(widget.overflow, widget.scroll_start.elapsed().as_secs_f32(), speed)
+        } else {
+            0
+        };
+
         let widget = &self.widgets[i];
         let fraction = if widget.dragging {
             widget.drag_fraction
@@ -522,18 +709,21 @@ impl App {
             hover: widget.hover,
             pressed: widget.pressed,
             dragging: widget.dragging,
+            scroll,
+            scroll_px,
         };
         if widget.last_frame.as_ref() != Some(&frame) {
             let art = self.snap.art.clone();
             let spotify = self.snap.app_id.to_lowercase().contains("spotify");
             let widget = &mut self.widgets[i];
-            render::paint(
+            let overflow = render::paint(
                 widget.hwnd,
                 &frame,
                 &mut widget.art,
                 art.as_deref().map(|v| v.as_slice()),
                 spotify,
             );
+            widget.overflow = if scroll { overflow } else { 0.0 };
             widget.last_frame = Some(frame);
         }
     }
@@ -746,9 +936,12 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
+            // Shift + wheel nudges the widget; a plain wheel changes volume.
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
             if GetKeyState(VK_SHIFT.0 as i32) < 0 {
-                let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
                 with_widget(hwnd, |a, i| a.nudge(i, if delta > 0 { 4 } else { -4 }));
+            } else if delta != 0 && with_app(|a| a.cfg.wheel_volume) == Some(true) {
+                volume_step(delta > 0);
             }
             LRESULT(0)
         }
@@ -760,14 +953,36 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TIMER => {
-            with_app(|a| a.tick());
+            if wparam.0 == ANIM_TIMER_ID {
+                with_app(|a| a.animate());
+            } else {
+                with_app(|a| a.tick());
+            }
             LRESULT(0)
         }
         WM_APP_UPDATE => {
             with_app(|a| {
                 a.pull_snapshot();
+                a.sync_tray(false);
                 a.tick();
             });
+            LRESULT(0)
+        }
+        tray::WM_TRAY => {
+            match lparam.0 as u32 {
+                WM_LBUTTONUP => {
+                    if let Some(module) = with_app(|a| a.module) {
+                        settings::open(module);
+                    }
+                }
+                WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        _ if msg != 0 && msg == TASKBAR_CREATED.load(Ordering::Relaxed) => {
+            // Explorer restarted: the tray icon has to be added again.
+            with_app(|a| a.sync_tray(true));
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -784,12 +999,13 @@ fn main() {
 
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        settings::enable_visual_styles();
+        settings::init_controls();
         render::init();
 
         let Ok(module) = GetModuleHandleW(None) else { return };
         let module: HINSTANCE = module.into();
 
+        let app_icon = LoadIconW(Some(module), PCWSTR(1 as *const u16)).unwrap_or_default();
         let widget_class = WNDCLASSW {
             lpfnWndProc: Some(widget_proc),
             hInstance: module,
@@ -800,6 +1016,7 @@ fn main() {
         let controller_class = WNDCLASSW {
             lpfnWndProc: Some(controller_proc),
             hInstance: module,
+            hIcon: app_icon,
             lpszClassName: w!("TaskbarMediaController"),
             ..Default::default()
         };
@@ -808,23 +1025,27 @@ fn main() {
         }
         settings::register_class(module);
 
-        // Hidden message-only window: timer + updates from the worker.
+        // Hidden window that owns the timers and the tray icon and receives
+        // updates from the worker. (Not a message-only window: those do not
+        // get the "TaskbarCreated" broadcast.)
         let Ok(controller) = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            WS_EX_TOOLWINDOW,
             w!("TaskbarMediaController"),
             w!("Taskbar Media"),
-            WINDOW_STYLE(0),
+            WS_POPUP,
             0,
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None,
             None,
             Some(module),
             None,
         ) else {
             return;
         };
+        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
+        probe::spawn();
 
         let cfg = Config::load();
         media::SPOTIFY_ONLY.store(cfg.spotify_only, Ordering::Relaxed);
@@ -840,6 +1061,10 @@ fn main() {
         APP.with(|cell| {
             *cell.borrow_mut() = Some(App {
                 module,
+                controller,
+                tray_shown: false,
+                tray_tip: String::new(),
+                anim_on: false,
                 shared,
                 tx,
                 snap: Snapshot::default(),
@@ -851,7 +1076,10 @@ fn main() {
             });
         });
         SetTimer(Some(controller), TIMER_ID, TICK_MS, None);
-        with_app(|a| a.tick());
+        with_app(|a| {
+            a.sync_tray(false);
+            a.tick();
+        });
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -863,5 +1091,11 @@ fn main() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+
+        with_app(|a| {
+            if a.tray_shown {
+                tray::remove(a.controller);
+            }
+        });
     }
 }

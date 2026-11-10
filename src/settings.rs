@@ -10,10 +10,6 @@ use windows::Win32::Graphics::Gdi::{
     CreateFontW, EnumDisplayMonitors, GetMonitorInfoW, GetSysColorBrush, MonitorFromPoint,
     COLOR_3DFACE, HDC, HFONT, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
-use windows::Win32::System::ApplicationInstallationAndServicing::{
-    ActivateActCtx, CreateActCtxW, ACTCTXW,
-};
-use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -23,6 +19,10 @@ use crate::config::{self, Config, DISPLAY_ALL, DISPLAY_MAIN, DISPLAY_ONE};
 const ID_AUTOSTART: i32 = 100;
 const ID_HIDE_PAUSED: i32 = 101;
 const ID_SHOW_TIMES: i32 = 102;
+const ID_TRAY: i32 = 103;
+const ID_VOLUME: i32 = 104;
+const ID_AVOID: i32 = 105;
+const ID_SCROLL: i32 = 106;
 const ID_SOURCE: i32 = 110;
 const ID_DISPLAY: i32 = 111;
 const ID_SIZE: i32 = 112;
@@ -45,6 +45,9 @@ const CBS_DROPDOWNLIST: u32 = 0x0003;
 const BN_CLICKED: u32 = 0;
 const CBN_SELCHANGE: u32 = 1;
 
+/// Client height at 96 dpi; must match the layout in `open`.
+const CLIENT_H: i32 = 650;
+
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
 thread_local! {
@@ -57,28 +60,10 @@ pub fn hwnd() -> HWND {
     HWND(SETTINGS_HWND.load(Ordering::Relaxed) as *mut c_void)
 }
 
-/// Opt in to themed (visual styles) controls. The exe carries no manifest, so
-/// borrow the common-controls v6 one that ships inside shell32.dll.
-pub fn enable_visual_styles() {
+/// Register the standard control classes. Themed (visual styles) controls
+/// come from the common-controls v6 dependency in the exe's manifest.
+pub fn init_controls() {
     unsafe {
-        let mut dir = [0u16; 260];
-        let len = GetSystemDirectoryW(Some(&mut dir)) as usize;
-        if len == 0 || len >= dir.len() {
-            return;
-        }
-        let ctx = ACTCTXW {
-            cbSize: std::mem::size_of::<ACTCTXW>() as u32,
-            // RESOURCE_NAME_VALID | ASSEMBLY_DIRECTORY_VALID | SET_PROCESS_DEFAULT
-            dwFlags: 0x008 | 0x004 | 0x010,
-            lpSource: w!("shell32.dll"),
-            lpAssemblyDirectory: PCWSTR(dir.as_ptr()),
-            lpResourceName: PCWSTR(124 as *const u16),
-            ..Default::default()
-        };
-        if let Ok(handle) = CreateActCtxW(&ctx) {
-            let mut cookie = 0usize;
-            let _ = ActivateActCtx(Some(handle), &mut cookie);
-        }
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_STANDARD_CLASSES,
@@ -94,6 +79,7 @@ pub fn register_class(module: HINSTANCE) {
             hInstance: module,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             hbrBackground: GetSysColorBrush(COLOR_3DFACE),
+            hIcon: LoadIconW(Some(module), PCWSTR(1 as *const u16)).unwrap_or_default(),
             lpszClassName: w!("TaskbarMediaSettings"),
             ..Default::default()
         };
@@ -244,7 +230,7 @@ pub fn open(module: HINSTANCE) {
 
         let cfg = crate::current_config();
         let d = GetDpiForSystem().max(96) as f32 / 96.0;
-        let (client_w, client_h) = ((380.0 * d) as i32, (542.0 * d) as i32);
+        let (client_w, client_h) = ((380.0 * d) as i32, (CLIENT_H as f32 * d) as i32);
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let mut wr = RECT { left: 0, top: 0, right: client_w, bottom: client_h };
         let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
@@ -304,6 +290,10 @@ pub fn open(module: HINSTANCE) {
         b.checkbox("Start with Windows", y, ID_AUTOSTART, config::autostart_enabled());
         y += 26;
         b.checkbox("Hide the widget while playback is paused", y, ID_HIDE_PAUSED, cfg.hide_paused);
+        y += 26;
+        b.checkbox("Show an icon in the notification area", y, ID_TRAY, cfg.tray_icon);
+        y += 26;
+        b.checkbox("Scroll over the widget to change the volume", y, ID_VOLUME, cfg.wheel_volume);
         y += 30;
         b.label("Show media from", y);
         b.combo(y, ID_SOURCE, &strings(&["Any app", "Spotify only"]), cfg.spotify_only as usize);
@@ -349,6 +339,8 @@ pub fn open(module: HINSTANCE) {
             b.font,
         );
         y += 70;
+        b.checkbox("Shrink instead of covering app icons (Windows 11)", y, ID_AVOID, cfg.avoid_apps);
+        y += 30;
         b.button("Reset positions", 16, y, 130, ID_RESET_POS, false);
 
         // ---- Appearance ----
@@ -378,10 +370,14 @@ pub fn open(module: HINSTANCE) {
         );
         y += 34;
         b.checkbox("Show elapsed and total time", y, ID_SHOW_TIMES, cfg.show_times);
+        y += 26;
+        b.checkbox("Scroll titles that are too long to fit", y, ID_SCROLL, cfg.scroll_titles);
 
         // ---- Buttons ----
-        b.button("Exit Taskbar Media", 16, 500, 150, ID_EXIT, false);
-        b.button("Close", 274, 500, 90, ID_CLOSE, true);
+        y += 38;
+        b.button("Exit Taskbar Media", 16, y, 150, ID_EXIT, false);
+        b.button("Close", 274, y, 90, ID_CLOSE, true);
+        debug_assert_eq!(y + 28 + 14, CLIENT_H);
 
         let _ = ShowWindow(parent, SW_SHOWNORMAL);
         let _ = SetForegroundWindow(parent);
@@ -408,6 +404,22 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
         (ID_HIDE_PAUSED, BN_CLICKED) => {
             let v = checked(hwnd, id);
             crate::update_config(|c: &mut Config| c.hide_paused = v);
+        }
+        (ID_TRAY, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.tray_icon = v);
+        }
+        (ID_VOLUME, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.wheel_volume = v);
+        }
+        (ID_AVOID, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.avoid_apps = v);
+        }
+        (ID_SCROLL, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.scroll_titles = v);
         }
         (ID_SHOW_TIMES, BN_CLICKED) => {
             let v = checked(hwnd, id);

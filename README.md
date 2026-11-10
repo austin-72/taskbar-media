@@ -15,13 +15,15 @@ From left to right:
 It uses Windows' own media session API, so it works with anything that shows
 up in the Windows media flyout: Spotify (desktop and Store versions), browsers,
 Media Player, foobar2000, and so on. The widget hides itself when nothing is
-playing and when a full-screen app is in front.
+playing and when a full-screen app is in front. Titles that are too long to
+fit scroll, and on Windows 11 the widget shrinks rather than cover app icons.
 
 ## Use
 
 Run `TaskbarMedia.exe`. There is no installer and no other files.
 
-- Click the gear (or right-click the widget) for settings
+- Click the gear, right-click the widget, or use the tray icon for settings
+- Mouse wheel over the widget changes the volume
 - Shift + mouse wheel over a widget nudges it left or right
 
 ## Settings
@@ -30,11 +32,14 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 
 - **Start with Windows**
 - **Hide while paused**
+- **Tray icon** and **wheel volume** on or off
 - **Show media from**: any app, or Spotify only
 - **Show on**: the main taskbar, all taskbars, or one chosen display
 - **Text size**, **width**, **text color**
 - **Rendering**: smooth (drawn at 2-3x and scaled down) or sharp (pixel-snapped)
+- **Shrink instead of covering app icons** (Windows 11)
 - **Show elapsed and total time**
+- **Scroll long titles**
 
 Requires Windows 10 (1809 or later) or Windows 11, 64-bit, with the taskbar at
 the bottom or top of the screen. Taskbars on other displays exist only when
@@ -43,6 +48,10 @@ the bottom or top of the screen. Taskbars on other displays exist only when
 ## Build
 
     cargo build --release
+
+Building on Windows needs the MSVC toolchain and Windows SDK (for `rc.exe`).
+Each push is also built by GitHub Actions, and publishing a release on GitHub
+attaches a freshly built `TaskbarMedia.exe` to it.
 
 Settings live in `HKCU\Software\TaskbarMedia`; "Start with Windows" adds a
 value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.

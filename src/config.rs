@@ -36,6 +36,13 @@ pub struct Config {
     pub show_times: bool,
     pub hide_paused: bool,
     pub spotify_only: bool,
+    /// Scroll titles that are too long to fit, instead of cutting them off.
+    pub scroll_titles: bool,
+    /// Mouse wheel over the widget changes the system volume.
+    pub wheel_volume: bool,
+    /// Shrink the widget rather than cover app buttons (Windows 11).
+    pub avoid_apps: bool,
+    pub tray_icon: bool,
     /// Sideways nudge in pixels, for the main taskbar and for the others.
     pub offset: i32,
     pub offset2: i32,
@@ -59,6 +66,10 @@ impl Config {
             show_times: d(w!("ShowTimes"), 1, 1) == 1,
             hide_paused: d(w!("HidePaused"), 0, 1) == 1,
             spotify_only: d(w!("SpotifyOnly"), 0, 1) == 1,
+            scroll_titles: d(w!("ScrollTitles"), 1, 1) == 1,
+            wheel_volume: d(w!("WheelVolume"), 1, 1) == 1,
+            avoid_apps: d(w!("AvoidApps"), 1, 1) == 1,
+            tray_icon: d(w!("TrayIcon"), 1, 1) == 1,
             offset: off(w!("Offset")),
             offset2: off(w!("Offset2")),
         }
@@ -74,6 +85,10 @@ impl Config {
         write_dword(SETTINGS_KEY, w!("ShowTimes"), self.show_times as u32);
         write_dword(SETTINGS_KEY, w!("HidePaused"), self.hide_paused as u32);
         write_dword(SETTINGS_KEY, w!("SpotifyOnly"), self.spotify_only as u32);
+        write_dword(SETTINGS_KEY, w!("ScrollTitles"), self.scroll_titles as u32);
+        write_dword(SETTINGS_KEY, w!("WheelVolume"), self.wheel_volume as u32);
+        write_dword(SETTINGS_KEY, w!("AvoidApps"), self.avoid_apps as u32);
+        write_dword(SETTINGS_KEY, w!("TrayIcon"), self.tray_icon as u32);
         write_dword(SETTINGS_KEY, w!("Offset"), self.offset as u32);
         write_dword(SETTINGS_KEY, w!("Offset2"), self.offset2 as u32);
     }

@@ -67,6 +67,8 @@ pub struct LayoutParams {
     /// 0 compact, 1 normal, 2 wide.
     pub width: u32,
     pub show_times: bool,
+    /// Art and buttons only, for when there is no room for the text.
+    pub mini: bool,
 }
 
 impl LayoutParams {
@@ -123,6 +125,17 @@ impl Layout {
         let buttons = [0.0, 1.0, 2.0].map(|i| Rect { x: bx + i * bw, y: by, w: bw, h: bh });
 
         let tx = bx + 3.0 * bw + (8.0 * u).round();
+        if p.mini {
+            return Layout {
+                width: bx + 3.0 * bw + (6.0 * u).round(),
+                u,
+                t,
+                gear,
+                art,
+                buttons,
+                ..Default::default()
+            };
+        }
         let tw = (text_w * u).round();
         let row1_h = 17.0 * u * t;
         let row2_h = 13.0 * u * t;
@@ -221,6 +234,10 @@ pub struct Frame {
     pub hover: Hit,
     pub pressed: Hit,
     pub dragging: bool,
+    /// Scroll a too-long title instead of ending it with "...".
+    pub scroll: bool,
+    /// How far the title is currently scrolled, in pixels.
+    pub scroll_px: i32,
 }
 
 /// A widget's album art, decoded and scaled to the size it is drawn at.
@@ -254,7 +271,8 @@ pub fn init() {
     }
 }
 
-/// Draw `f` and push it to the layered window.
+/// Draw `f` and push it to the layered window. Returns how many pixels wider
+/// the title line is than the space for it (0 or less when it fits).
 ///
 /// `spotify` enables detection of the framed thumbnail some Spotify versions
 /// publish (see `legacy_spotify_frame`).
@@ -264,9 +282,9 @@ pub fn paint(
     cache: &mut Option<ArtCache>,
     art: Option<&[u8]>,
     spotify: bool,
-) {
+) -> f32 {
     if f.w <= 0 || f.h <= 0 {
-        return;
+        return 0.0;
     }
     // Supersampling factor.
     let k: i32 = if !f.smooth {
@@ -291,12 +309,13 @@ pub fn paint(
             &mut bitmap,
         );
         if bitmap.is_null() {
-            return;
+            return 0.0;
         }
+        let mut overflow = 0.0;
         let mut g: *mut GpGraphics = null_mut();
         GdipGetImageGraphicsContext(bitmap as *mut GpImage, &mut g);
         if !g.is_null() {
-            draw(g, f, &layout, k > 1, cache, art, spotify);
+            overflow = draw(g, f, &layout, k, cache, art, spotify) / k as f32;
             GdipFlush(g, FlushIntentionSync);
             GdipDeleteGraphics(g);
         }
@@ -349,6 +368,7 @@ pub fn paint(
         }
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
+        overflow
     }
 }
 
@@ -388,11 +408,12 @@ unsafe fn draw(
     g: *mut GpGraphics,
     f: &Frame,
     l: &Layout,
-    supersampled: bool,
+    k: i32,
     cache: &mut Option<ArtCache>,
     art: Option<&[u8]>,
     spotify: bool,
-) {
+) -> f32 {
+    let supersampled = k > 1;
     let u = l.u;
     let fg: u32 = if f.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
     let primary = alpha(fg, if f.light { 0xE4 } else { 0xFF });
@@ -444,7 +465,7 @@ unsafe fn draw(
         _ => {
             fill_round_color(g, alpha(fg, 0x24), l.art, radius);
             let font = make_font(w!("Segoe UI Symbol"), l.art.h * 0.55);
-            let fmt = make_format(StringAlignmentCenter);
+            let fmt = make_format(StringAlignmentCenter, true);
             draw_text(g, "\u{266B}", font, l.art, fmt, dim);
             GdipDeleteFont(font);
             GdipDeleteStringFormat(fmt);
@@ -489,24 +510,49 @@ unsafe fn draw(
     }
 
     // ---- text and seek bar -------------------------------------------------
+    if f.params.mini {
+        return 0.0;
+    }
     let ts = u * l.t;
     let title_font = make_font(w!("Segoe UI Semibold"), 12.0 * ts);
     let body_font = make_font(w!("Segoe UI"), 12.0 * ts);
     let small_font = make_font(w!("Segoe UI"), 10.0 * ts);
-    let near = make_format(StringAlignmentNear);
-    let far = make_format(StringAlignmentFar);
+    let near = make_format(StringAlignmentNear, true);
+    let far = make_format(StringAlignmentFar, true);
+    let free = make_format(StringAlignmentNear, false);
 
+    // Row 1: "Title · Artist" when there is a seek bar underneath, otherwise
+    // just the title (the artist then gets row 2 to itself).
     let title = if f.title.is_empty() { "Unknown track" } else { f.title.as_str() };
-    if f.has_timeline {
-        // Row 1: "Title · Artist", row 2: the seek bar.
-        let title_w = measure(g, title, title_font, l.row1, near).min(l.row1.w);
+    let artist = if f.has_timeline && !f.artist.is_empty() {
+        format!("\u{00B7} {}", f.artist)
+    } else {
+        String::new()
+    };
+    let unbounded = Rect { w: 100_000.0, ..l.row1 };
+    let title_full = measure(g, title, title_font, unbounded, free);
+    let artist_full = measure(g, &artist, body_font, unbounded, free);
+    let overflow = title_full + artist_full + 2.0 * u - l.row1.w;
+
+    if f.scroll && overflow > 0.0 {
+        // Too long: draw it whole, shifted left, and clip to the row.
+        let x = l.row1.x - (f.scroll_px * k) as f32;
+        GdipSetClipRect(g, l.row1.x, l.row1.y, l.row1.w, l.row1.h, CombineModeReplace);
+        draw_text(g, title, title_font, Rect { x, w: title_full + 8.0 * u, ..l.row1 }, free, primary);
+        let r = Rect { x: x + title_full, w: artist_full + 8.0 * u, ..l.row1 };
+        draw_text(g, &artist, body_font, r, free, dim);
+        GdipResetClip(g);
+    } else {
+        let title_w = title_full.min(l.row1.w);
         draw_text(g, title, title_font, l.row1, near, primary);
         let rest = l.row1.w - title_w;
-        if !f.artist.is_empty() && rest > 36.0 * u {
+        if !artist.is_empty() && rest > 36.0 * u {
             let r = Rect { x: l.row1.x + title_w, w: rest, ..l.row1 };
-            draw_text(g, &format!("\u{00B7} {}", f.artist), body_font, r, near, dim);
+            draw_text(g, &artist, body_font, r, near, dim);
         }
+    }
 
+    if f.has_timeline {
         if f.params.show_times {
             draw_text(g, &f.elapsed, small_font, l.elapsed, near, dim);
             draw_text(g, &f.total, small_font, l.total, far, dim);
@@ -526,8 +572,7 @@ unsafe fn draw(
             GdipDeleteBrush(brush);
         }
     } else {
-        // No timeline from this player: title above, artist below.
-        draw_text(g, title, title_font, l.row1, near, primary);
+        // No timeline from this player: artist on the second row.
         let artist_font = make_font(w!("Segoe UI"), 11.0 * ts);
         draw_text(g, &f.artist, artist_font, l.row2, near, dim);
         GdipDeleteFont(artist_font);
@@ -538,6 +583,8 @@ unsafe fn draw(
     GdipDeleteFont(small_font);
     GdipDeleteStringFormat(near);
     GdipDeleteStringFormat(far);
+    GdipDeleteStringFormat(free);
+    overflow
 }
 
 /// An eight-toothed cog with a round hole, centred on (cx, cy).
@@ -613,13 +660,19 @@ unsafe fn make_font(family: PCWSTR, px: f32) -> *mut GpFont {
     font
 }
 
-unsafe fn make_format(align: StringAlignment) -> *mut GpStringFormat {
+/// `fit`: end text that does not fit with "...". Otherwise it is drawn whole,
+/// even past the edge of its rectangle.
+unsafe fn make_format(align: StringAlignment, fit: bool) -> *mut GpStringFormat {
     const NO_WRAP: i32 = 0x1000;
+    const NO_CLIP: i32 = 0x4000;
     let mut fmt: *mut GpStringFormat = null_mut();
-    GdipCreateStringFormat(NO_WRAP, 0, &mut fmt);
+    GdipCreateStringFormat(if fit { NO_WRAP } else { NO_WRAP | NO_CLIP }, 0, &mut fmt);
     GdipSetStringFormatAlign(fmt, align);
     GdipSetStringFormatLineAlign(fmt, StringAlignmentCenter);
-    GdipSetStringFormatTrimming(fmt, StringTrimmingEllipsisCharacter);
+    GdipSetStringFormatTrimming(
+        fmt,
+        if fit { StringTrimmingEllipsisCharacter } else { StringTrimmingNone },
+    );
     fmt
 }
 
