@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.6.0
+
+### Added
+- Volume button on the widget. Clicking it opens a mixer above the taskbar
+  with a slider and mute button for the system volume and for every app
+  that is playing sound. Click elsewhere or press Esc to close it. The
+  button's icon reflects the player's volume, or the system volume if you
+  prefer (Settings, Behavior).
+
+### Changed
+- The output device button now opens a list styled like the mixer, with an
+  icon for each device and a tick on the current one, in place of a plain
+  Windows menu.
+- The output device button's speaker icon is now a loudspeaker cabinet, so
+  it is not confused with the volume icon.
+
 ## 1.5.0
 
 ### Added

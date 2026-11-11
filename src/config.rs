@@ -75,6 +75,9 @@ pub struct Config {
     pub art_click: u32,
     /// Clicking the title: 0 copies it, 1 opens the player, 2 nothing.
     pub title_click: u32,
+    /// What the volume button's icon reflects: 0 the player's own volume,
+    /// 1 the system volume.
+    pub volume_target: u32,
     /// Clicking the output button: 0 lists the devices, 1 switches between
     /// `output_a` and `output_b`.
     pub output_click: u32,
@@ -103,8 +106,9 @@ pub const ITEM_OUTPUT: u8 = 9;
 pub const ITEM_TITLE: u8 = 10;
 pub const ITEM_SEEK: u8 = 11;
 pub const ITEM_PLAYERS: u8 = 12;
+pub const ITEM_VOLUME: u8 = 13;
 /// How many items there are.
-pub const ITEM_COUNT: usize = 12;
+pub const ITEM_COUNT: usize = 13;
 
 /// (item, name in the registry, name in the settings window), default order.
 pub const ITEMS: [(u8, &str, &str); ITEM_COUNT] = [
@@ -117,6 +121,7 @@ pub const ITEMS: [(u8, &str, &str); ITEM_COUNT] = [
     (ITEM_NEXT, "next", "Next"),
     (ITEM_REPEAT, "repeat", "Repeat"),
     (ITEM_INFO, "info", "Title over seek bar"),
+    (ITEM_VOLUME, "volume", "Volume button (opens the mixer)"),
     (ITEM_OUTPUT, "output", "Output device"),
     (ITEM_TITLE, "title", "Title on its own"),
     (ITEM_SEEK, "seek", "Seek bar on its own"),
@@ -260,6 +265,7 @@ impl Config {
             seek_size: d(w!("SeekSize"), 1, 2),
             background: d(w!("Background"), 0, 2),
             art_click: d(w!("ArtClick"), 0, 2),
+            volume_target: d(w!("VolumeTarget"), 0, 1),
             output_click: d(w!("OutputClick"), 0, 1),
             output_a: read_string(SETTINGS_KEY, w!("OutputA")).unwrap_or_default(),
             output_b: read_string(SETTINGS_KEY, w!("OutputB")).unwrap_or_default(),
@@ -301,6 +307,7 @@ impl Config {
         write_dword(SETTINGS_KEY, w!("Background"), self.background);
         write_dword(SETTINGS_KEY, w!("ArtClick"), self.art_click);
         write_dword(SETTINGS_KEY, w!("TitleClick"), self.title_click);
+        write_dword(SETTINGS_KEY, w!("VolumeTarget"), self.volume_target);
         write_dword(SETTINGS_KEY, w!("OutputClick"), self.output_click);
         write_string(SETTINGS_KEY, w!("OutputA"), &self.output_a);
         write_string(SETTINGS_KEY, w!("OutputB"), &self.output_b);

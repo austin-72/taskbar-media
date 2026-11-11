@@ -39,7 +39,7 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromPoint, ScreenToClient, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -51,7 +51,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SendInput, SetCapture, TrackMouseEvent, INPUT, INPUT_0,
     INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT,
-    VK_SHIFT, VK_VOLUME_DOWN, VK_VOLUME_UP,
+    VK_ESCAPE, VK_SHIFT, VK_VOLUME_DOWN, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, ShellExecuteW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
@@ -182,10 +182,51 @@ struct App {
     seek_override: Option<SeekOverride>,
     /// Volume level to show for a moment after the wheel changed it.
     volume_flash: Option<(u8, Instant)>,
+    /// (level 0..=1, muted) for the volume button, while it is on a widget.
+    volume: Option<(f32, bool)>,
+    /// The volume mixer popup: its window and, while open, its contents.
+    /// Row 0 is the system volume (key ""), the rest are apps.
+    mixer: HWND,
+    mixer_open: bool,
+    /// The same window doubles as the output device list.
+    popup: Popup,
+    outputs_rows: Vec<devices::Device>,
+    outputs_current: String,
+    outputs_hover: Option<usize>,
+    outputs_frame: Option<render::Picker>,
+    mixer_rows: Vec<volume::MixerEntry>,
+    mixer_hover: Option<(usize, MixerPart)>,
+    mixer_drag: Option<usize>,
+    mixer_frame: Option<render::Mixer>,
+    /// DPI scale, and the spot it hangs from: the button's centre x, and the
+    /// widget's top and bottom.
+    mixer_scale: f32,
+    mixer_anchor: (i32, i32, i32),
+    /// It has had keyboard focus (so losing focus should close it).
+    mixer_was_active: bool,
+    /// Since when the mouse has been away from it and the widget.
+    mixer_away: Option<Instant>,
     /// Message to show for a moment in place of the title.
     notice: Option<(String, Instant)>,
     /// The current audio output, while the output button is on the widget.
     output: Option<devices::Device>,
+}
+
+/// What the popup above the widget is showing.
+#[derive(Clone, Copy, PartialEq)]
+enum Popup {
+    /// The volume mixer.
+    Mixer,
+    /// The list of output devices.
+    Outputs,
+}
+
+/// A part of a row in the volume mixer popup.
+#[derive(Clone, Copy, PartialEq)]
+enum MixerPart {
+    /// The speaker icon: click to mute.
+    Icon,
+    Slider,
 }
 
 /// What a click asks for, carried out once the app state is released.
@@ -193,8 +234,6 @@ enum Action {
     None,
     Open(String),
     Settings,
-    /// Show the list of output devices.
-    Outputs,
     /// Switch between the two chosen output devices.
     ToggleOutput,
 }
@@ -336,6 +375,7 @@ fn is_shell_or_own_window(hwnd: HWND) -> bool {
             | "Shell_SecondaryTrayWnd"
             | "TaskbarMediaWidget"
             | "TaskbarMediaCard"
+            | "TaskbarMediaMixer"
     )
 }
 
@@ -452,6 +492,19 @@ impl Widget {
 }
 
 impl App {
+    /// The volume button's icon shows the system volume rather than the player's.
+    fn volume_is_system(&self) -> bool {
+        self.cfg.volume_target == 1
+    }
+
+    fn refresh_volume(&mut self) {
+        self.volume = if self.cfg.shows(config::ITEM_VOLUME) && self.snap.active {
+            volume::read(&self.snap.app_id, self.volume_is_system())
+        } else {
+            None
+        };
+    }
+
     /// Whether the seek bar is on screen: the player reports a timeline and
     /// the chosen text layout has a seek bar row.
     fn seek_shown(&self) -> bool {
@@ -626,6 +679,12 @@ impl App {
         if self.seek_override.as_ref().is_some_and(|o| o.at.elapsed() > Duration::from_secs(3)) {
             self.seek_override = None;
         }
+        // The volume can be changed elsewhere (the player, the Windows
+        // mixer, the keyboard), so re-read it about once a second.
+        if self.ticks % 5 == 1 {
+            self.refresh_volume();
+        }
+        self.tick_mixer();
         if self.volume_flash.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(1500)) {
             self.volume_flash = None;
         }
@@ -794,6 +853,368 @@ impl App {
         }
     }
 
+    // ---- the volume mixer popup --------------------------------------------
+
+    /// The system volume followed by every app in the Windows mixer.
+    fn load_mixer_rows() -> Vec<volume::MixerEntry> {
+        let (level, muted) = volume::read("", true).unwrap_or((1.0, false));
+        let mut rows = vec![volume::MixerEntry { key: String::new(), name: "System".to_string(), level, muted }];
+        rows.extend(volume::mixer());
+        rows
+    }
+
+    /// Open the mixer above widget `i`'s volume button, or close it.
+    fn toggle_mixer(&mut self, i: usize) {
+        self.toggle_popup(i, Popup::Mixer);
+    }
+
+    /// Open the output device list above widget `i`'s output button, or
+    /// close it.
+    fn toggle_outputs(&mut self, i: usize) {
+        self.toggle_popup(i, Popup::Outputs);
+    }
+
+    fn load_outputs(&mut self) {
+        self.outputs_rows = devices::list();
+        self.outputs_current = devices::current().map(|d| d.id).unwrap_or_default();
+    }
+
+    /// Open the popup as `kind` above the matching button of widget `i`. If
+    /// it is already open as that kind, close it instead.
+    fn toggle_popup(&mut self, i: usize, kind: Popup) {
+        if self.mixer_open {
+            let same = self.popup == kind;
+            self.close_mixer();
+            if same {
+                return;
+            }
+        }
+        if i >= self.widgets.len() {
+            return;
+        }
+        self.popup = kind;
+        let widget = &self.widgets[i];
+        let (wx, wy, _, wh) = widget.rect;
+        let button = if kind == Popup::Mixer { widget.layout.vol_icon } else { widget.layout.output };
+        self.mixer_scale = widget.params.scale.max(0.5);
+        self.mixer_anchor = (wx + button.cx() as i32, wy, wy + wh);
+        match kind {
+            Popup::Mixer => self.mixer_rows = Self::load_mixer_rows(),
+            Popup::Outputs => {
+                self.load_outputs();
+                if self.outputs_rows.is_empty() {
+                    return;
+                }
+            }
+        }
+        self.outputs_hover = None;
+        self.outputs_frame = None;
+        self.mixer_hover = None;
+        self.mixer_drag = None;
+        self.mixer_frame = None;
+        self.mixer_was_active = false;
+        self.mixer_away = None;
+        self.mixer_open = true;
+        self.hide_card();
+        self.show_mixer();
+        // Take focus, so that Esc and clicking elsewhere close it.
+        unsafe {
+            let _ = SetForegroundWindow(self.mixer);
+            self.mixer_was_active = GetForegroundWindow() == self.mixer;
+        }
+    }
+
+    fn close_mixer(&mut self) {
+        if !self.mixer_open {
+            return;
+        }
+        self.mixer_open = false;
+        self.mixer_drag = None;
+        self.mixer_frame = None;
+        self.outputs_frame = None;
+        unsafe {
+            let _ = ShowWindow(self.mixer, SW_HIDE);
+        }
+        self.refresh_volume();
+        for j in 0..self.widgets.len() {
+            if self.widgets[j].visible {
+                self.repaint(j);
+            }
+        }
+    }
+
+    /// Draw the mixer if anything changed, and keep it placed above (or,
+    /// for a taskbar at the top, below) the volume button.
+    fn show_mixer(&mut self) {
+        let accent = match self.cfg.accent_mode {
+            2 => 0,
+            3 => self.cfg.accent_rgb,
+            _ => self.system_accent,
+        };
+        let frame = render::Mixer {
+            scale: self.mixer_scale,
+            smooth: self.cfg.smooth,
+            light: self.system_light,
+            font: self.cfg.font,
+            accent,
+            rows: self
+                .mixer_rows
+                .iter()
+                .map(|r| render::MixerRow {
+                    name: r.name.clone(),
+                    level: (r.level * 100.0).round() as u8,
+                    muted: r.muted,
+                })
+                .collect(),
+            hover_row: self.mixer_hover.map_or(-1, |(row, _)| row as i32),
+            hover_icon: self.mixer_hover.is_some_and(|(_, part)| part == MixerPart::Icon),
+            drag_row: self.mixer_drag.map_or(-1, |row| row as i32),
+        };
+        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
+        let picker = render::Picker {
+            scale: self.mixer_scale,
+            smooth: self.cfg.smooth,
+            light: self.system_light,
+            font: self.cfg.font,
+            accent,
+            rows: self
+                .outputs_rows
+                .iter()
+                .map(|d| render::PickerRow {
+                    name: d.name.clone(),
+                    headphones: d.headphones,
+                    current: d.id == self.outputs_current,
+                })
+                .collect(),
+            hover_row: self.outputs_hover.map_or(-1, |row| row as i32),
+        };
+        let (w, h) = match self.popup {
+            Popup::Mixer => (layout.w, layout.h),
+            Popup::Outputs => {
+                let (w, h, _) = render::picker_layout(self.mixer_scale, self.outputs_rows.len());
+                (w, h)
+            }
+        };
+        let (cx, top, bottom) = self.mixer_anchor;
+        let gap = (8.0 * self.mixer_scale) as i32;
+        let (mut x, mut y) = (cx - w / 2, top - h - gap);
+        unsafe {
+            let monitor = MonitorFromPoint(POINT { x: cx, y: top }, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                let m = mi.rcMonitor;
+                if y < m.top {
+                    y = bottom + gap;
+                }
+                x = x.min(m.right - w - gap).max(m.left + gap);
+            }
+            match self.popup {
+                Popup::Mixer if self.mixer_frame.as_ref() != Some(&frame) => {
+                    render::paint_mixer(self.mixer, &frame);
+                    self.mixer_frame = Some(frame);
+                }
+                Popup::Outputs if self.outputs_frame.as_ref() != Some(&picker) => {
+                    render::paint_picker(self.mixer, &picker);
+                    self.outputs_frame = Some(picker);
+                }
+                _ => {}
+            }
+            let _ = SetWindowPos(
+                self.mixer,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    /// Called on every tick: keep the open mixer current, and close it once
+    /// it has lost focus.
+    fn tick_mixer(&mut self) {
+        if !self.mixer_open {
+            return;
+        }
+        unsafe {
+            let focused = GetForegroundWindow() == self.mixer;
+            if focused {
+                self.mixer_was_active = true;
+            } else if self.mixer_was_active && self.mixer_drag.is_none() {
+                self.close_mixer();
+                return;
+            } else {
+                // It never got focus (Windows can refuse), so it cannot tell
+                // when the user clicks elsewhere. Close it once the mouse has
+                // been away from it and the widgets for a couple of seconds.
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let inside = |r: (i32, i32, i32, i32)| {
+                    pt.x >= r.0 && pt.x < r.0 + r.2 && pt.y >= r.1 && pt.y < r.1 + r.3
+                };
+                let near = window_rect(self.mixer)
+                    .is_some_and(|r| inside((r.left, r.top, r.right - r.left, r.bottom - r.top)))
+                    || self.widgets.iter().any(|w| w.visible && inside(w.rect));
+                if near || self.mixer_drag.is_some() {
+                    self.mixer_away = None;
+                } else if self.mixer_away.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(2) {
+                    self.close_mixer();
+                    return;
+                }
+            }
+        }
+        match self.popup {
+            // Apps start and stop, and volumes change elsewhere.
+            Popup::Mixer if self.mixer_drag.is_none() && self.ticks % 2 == 0 => {
+                self.mixer_rows = Self::load_mixer_rows();
+            }
+            // Devices get plugged in and unplugged.
+            Popup::Outputs if self.ticks % 5 == 0 => self.load_outputs(),
+            _ => {}
+        }
+        self.show_mixer();
+    }
+
+    fn mixer_hit(&self, x: i32, y: i32) -> Option<(usize, MixerPart)> {
+        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
+        let (x, y) = (x as f32, y as f32);
+        let reach = 8.0 * self.mixer_scale;
+        layout.rows.iter().enumerate().find_map(|(i, r)| {
+            if !r.row.contains(x, y) {
+                None
+            } else if r.icon.contains(x, y) {
+                Some((i, MixerPart::Icon))
+            } else if x >= r.track.x - reach && x < r.track.x + r.track.w + reach {
+                Some((i, MixerPart::Slider))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Apply a volume level (0..=1) to a mixer row.
+    fn mixer_set_level(&mut self, row: usize, level: f32) {
+        let level = level.clamp(0.0, 1.0);
+        let Some(entry) = self.mixer_rows.get_mut(row) else { return };
+        // Moving the slider of something muted un-mutes it.
+        let unmute = entry.muted && level > 0.0;
+        entry.level = level;
+        if unmute {
+            entry.muted = false;
+        }
+        let key = entry.key.clone();
+        if key.is_empty() {
+            if unmute {
+                volume::set_mute("", true, false);
+            }
+            volume::set_level("", true, level);
+        } else {
+            if unmute {
+                volume::mixer_set_mute(&key, false);
+            }
+            volume::mixer_set_level(&key, level);
+        }
+    }
+
+    fn mixer_level_at(&self, row: usize, x: i32) -> f32 {
+        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
+        layout.rows.get(row).map_or(0.0, |r| ((x as f32 - r.track.x) / r.track.w.max(1.0)).clamp(0.0, 1.0))
+    }
+
+    /// The output list row at a point in the popup.
+    fn outputs_hit(&self, x: i32, y: i32) -> Option<usize> {
+        let (_, _, rows) = render::picker_layout(self.mixer_scale, self.outputs_rows.len());
+        rows.iter().position(|r| r.contains(x as f32, y as f32))
+    }
+
+    /// Make `device` the default output and say so on the widget.
+    fn apply_output(&mut self, device: &devices::Device) {
+        let message = if devices::set_default(&device.id) {
+            format!("Output: {}", device.name)
+        } else {
+            "Could not switch output".to_string()
+        };
+        if self.output.is_some() {
+            self.output = devices::current();
+        }
+        self.notice = Some((message, Instant::now()));
+    }
+
+    fn mixer_mouse_move(&mut self, x: i32, y: i32) {
+        if self.popup == Popup::Outputs {
+            self.outputs_hover = self.outputs_hit(x, y);
+            self.show_mixer();
+            return;
+        }
+        match self.mixer_drag {
+            Some(row) => {
+                let level = self.mixer_level_at(row, x);
+                self.mixer_set_level(row, level);
+            }
+            None => self.mixer_hover = self.mixer_hit(x, y),
+        }
+        self.show_mixer();
+    }
+
+    fn mixer_mouse_down(&mut self, x: i32, y: i32) {
+        if self.popup == Popup::Outputs {
+            // Choosing a device switches to it and closes the list.
+            if let Some(device) = self.outputs_hit(x, y).and_then(|row| self.outputs_rows.get(row).cloned()) {
+                self.apply_output(&device);
+                self.close_mixer();
+                self.tick();
+            }
+            return;
+        }
+        match self.mixer_hit(x, y) {
+            Some((row, MixerPart::Slider)) => {
+                self.mixer_drag = Some(row);
+                unsafe {
+                    SetCapture(self.mixer);
+                }
+                let level = self.mixer_level_at(row, x);
+                self.mixer_set_level(row, level);
+            }
+            Some((row, MixerPart::Icon)) => {
+                if let Some(entry) = self.mixer_rows.get_mut(row) {
+                    entry.muted = !entry.muted;
+                    let (key, mute) = (entry.key.clone(), entry.muted);
+                    if key.is_empty() {
+                        volume::set_mute("", true, mute);
+                    } else {
+                        volume::mixer_set_mute(&key, mute);
+                    }
+                }
+            }
+            None => {}
+        }
+        self.show_mixer();
+    }
+
+    fn mixer_mouse_up(&mut self) {
+        if self.mixer_drag.take().is_some() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            self.show_mixer();
+        }
+    }
+
+    /// Wheel over a row: 4% per notch.
+    fn mixer_wheel(&mut self, x: i32, y: i32, up: bool) {
+        if self.popup != Popup::Mixer {
+            return;
+        }
+        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
+        let row = layout.rows.iter().position(|r| r.row.contains(x as f32, y as f32));
+        if let Some(row) = row {
+            let level = self.mixer_rows[row].level + if up { 0.04 } else { -0.04 };
+            self.mixer_set_level(row, level);
+            self.show_mixer();
+        }
+    }
+
     fn hide_card(&mut self) {
         if self.card_visible {
             self.card_visible = false;
@@ -814,7 +1235,10 @@ impl App {
             let (x, y, width, height) = w.rect;
             w.visible && !w.dragging && pt.x >= x && pt.x < x + width && pt.y >= y && pt.y < y + height
         });
-        let allowed = self.cfg.hover_card && self.snap.active && !MENU_OPEN.load(Ordering::Relaxed);
+        let allowed = self.cfg.hover_card
+            && self.snap.active
+            && !self.mixer_open
+            && !MENU_OPEN.load(Ordering::Relaxed);
         if over.is_none() {
             self.card_dismissed = false;
         }
@@ -994,6 +1418,10 @@ impl App {
             notice: self.notice.as_ref().map(|(text, _)| text.clone()),
             update: update::available().is_some(),
             headphones: self.output.as_ref().is_some_and(|d| d.headphones),
+            vol: self.volume.map_or(0, |(level, _)| (level * 100.0).round() as u8),
+            vol_muted: self.volume.is_some_and(|(_, muted)| muted),
+            mixer_open: self.mixer_open && self.popup == Popup::Mixer,
+            outputs_open: self.mixer_open && self.popup == Popup::Outputs,
         };
         if widget.last_frame.as_ref() != Some(&frame) {
             let art = self.snap.art.clone();
@@ -1092,6 +1520,7 @@ impl App {
             if hit == self.widgets[i].pressed {
                 match hit {
                     Hit::Gear => action = Action::Settings,
+                    Hit::VolIcon => self.toggle_mixer(i),
                     Hit::PlayerUp | Hit::PlayerDown => {
                         // Step through the players, wrapping at the ends.
                         let ids = &self.snap.sessions;
@@ -1110,11 +1539,11 @@ impl App {
                     }
                     Hit::Output => {
                         let both = !self.cfg.output_a.is_empty() && !self.cfg.output_b.is_empty();
-                        action = if self.cfg.output_click == 1 && both {
-                            Action::ToggleOutput
+                        if self.cfg.output_click == 1 && both {
+                            action = Action::ToggleOutput;
                         } else {
-                            Action::Outputs
-                        };
+                            self.toggle_outputs(i);
+                        }
                     }
                     Hit::Art => match self.cfg.art_click {
                         0 => action = Action::Open(self.snap.app_id.clone()),
@@ -1296,24 +1725,6 @@ unsafe fn append_outputs(menu: HMENU, outputs: &[devices::Device], current: Opti
     }
 }
 
-/// The output button's menu: every playback device, current one ticked.
-fn output_menu(hwnd: HWND) {
-    const FIRST: usize = 1;
-    let outputs = devices::list();
-    if outputs.is_empty() {
-        return;
-    }
-    let current = devices::current().map(|d| d.id);
-    let choice = unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        append_outputs(menu, &outputs, current.as_deref(), FIRST);
-        track_menu(menu, hwnd)
-    };
-    if choice >= FIRST && choice < FIRST + outputs.len() {
-        switch_output(&outputs[choice - FIRST]);
-    }
-}
-
 /// Flip between the two output devices chosen in settings.
 fn toggle_output() {
     let Some((a, b)) = with_app(|app| (app.cfg.output_a.clone(), app.cfg.output_b.clone())) else {
@@ -1334,17 +1745,8 @@ fn toggle_output() {
 
 /// Make `device` the default output and say so on the widget.
 fn switch_output(device: &devices::Device) {
-    let message = if devices::set_default(&device.id) {
-        format!("Output: {}", device.name)
-    } else {
-        "Could not switch output".to_string()
-    };
-    let now = devices::current();
     with_app(|app| {
-        if app.output.is_some() {
-            app.output = now;
-        }
-        app.notice = Some((message, Instant::now()));
+        app.apply_output(device);
         app.tick();
     });
 }
@@ -1419,7 +1821,6 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             match action {
                 Some((Action::Open(app_id), _)) => launch::open_app(&app_id),
                 Some((Action::Settings, module)) => settings::open(module),
-                Some((Action::Outputs, _)) => output_menu(hwnd),
                 Some((Action::ToggleOutput, _)) => toggle_output(),
                 _ => {}
             }
@@ -1433,7 +1834,12 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             // Right-clicking the output button always lists the devices.
             let (x, y) = point(lparam);
             if with_widget(hwnd, |a, i| a.hit(i, x, y)) == Some(Hit::Output) {
-                output_menu(hwnd);
+                with_widget(hwnd, |a, i| {
+                    // Always the list, even when a click is set to switch.
+                    if !(a.mixer_open && a.popup == Popup::Outputs) {
+                        a.toggle_outputs(i);
+                    }
+                });
             } else {
                 show_menu(hwnd);
             }
@@ -1454,6 +1860,7 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     Some(level) => {
                         with_app(|a| {
                             a.volume_flash = Some((level, Instant::now()));
+                            a.refresh_volume();
                             a.tick();
                         });
                     }
@@ -1464,6 +1871,72 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe extern "system" fn mixer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_MOUSEMOVE => {
+            let (x, y) = point(lparam);
+            // Ask to be told when the mouse leaves, to clear the highlight.
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tme);
+            with_app(|a| a.mixer_mouse_move(x, y));
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            with_app(|a| {
+                if a.mixer_open && a.mixer_drag.is_none() {
+                    a.mixer_hover = None;
+                    a.outputs_hover = None;
+                    a.show_mixer();
+                }
+            });
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = point(lparam);
+            with_app(|a| a.mixer_mouse_down(x, y));
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            with_app(|a| a.mixer_mouse_up());
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|a| a.mixer_drag = None);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            // Wheel messages carry screen coordinates.
+            let (sx, sy) = point(lparam);
+            let mut pt = POINT { x: sx, y: sy };
+            let _ = ScreenToClient(hwnd, &mut pt);
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+            if delta != 0 {
+                with_app(|a| a.mixer_wheel(pt.x, pt.y, delta > 0));
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
+            with_app(|a| a.close_mixer());
+            LRESULT(0)
+        }
+        // Lost focus: the user clicked somewhere else.
+        WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
+            with_app(|a| {
+                if a.mixer_was_active {
+                    a.close_mixer();
+                }
+            });
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -1548,9 +2021,17 @@ fn main() {
             lpszClassName: w!("TaskbarMediaCard"),
             ..Default::default()
         };
+        let mixer_class = WNDCLASSW {
+            lpfnWndProc: Some(mixer_proc),
+            hInstance: module,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            lpszClassName: w!("TaskbarMediaMixer"),
+            ..Default::default()
+        };
         if RegisterClassW(&widget_class) == 0
             || RegisterClassW(&controller_class) == 0
             || RegisterClassW(&card_class) == 0
+            || RegisterClassW(&mixer_class) == 0
         {
             return;
         }
@@ -1583,6 +2064,23 @@ fn main() {
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
             w!("TaskbarMediaCard"),
             w!("Taskbar Media"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(module),
+            None,
+        )
+        .unwrap_or_default();
+
+        // The volume mixer popup: unlike the card it takes clicks and focus.
+        let mixer = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            w!("TaskbarMediaMixer"),
+            w!("Taskbar Media volume"),
             WS_POPUP,
             0,
             0,
@@ -1631,6 +2129,22 @@ fn main() {
                 ticks: 0,
                 seek_override: None,
                 volume_flash: None,
+                volume: None,
+                mixer,
+                mixer_open: false,
+                popup: Popup::Mixer,
+                outputs_rows: Vec::new(),
+                outputs_current: String::new(),
+                outputs_hover: None,
+                outputs_frame: None,
+                mixer_rows: Vec::new(),
+                mixer_hover: None,
+                mixer_drag: None,
+                mixer_frame: None,
+                mixer_scale: 1.0,
+                mixer_anchor: (0, 0, 0),
+                mixer_was_active: false,
+                mixer_away: None,
                 notice: None,
                 output: None,
             });

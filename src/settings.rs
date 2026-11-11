@@ -54,6 +54,7 @@ const ID_OUTPUT_CLICK: i32 = 136;
 const ID_OUTPUT_A: i32 = 137;
 const ID_OUTPUT_B: i32 = 138;
 const ID_LAYOUT_TARGET: i32 = 139;
+const ID_VOLUME_TARGET: i32 = 145;
 const ID_LAYOUT2: i32 = 107;
 const ID_HOVER: i32 = 108;
 const ID_TEXT_RGB: i32 = 124;
@@ -555,6 +556,14 @@ pub fn open(module: HINSTANCE) {
         );
         y += 30;
         b.choice(
+            "Volume icon shows",
+            y,
+            ID_VOLUME_TARGET,
+            &["Player volume", "System volume"],
+            cfg.volume_target,
+        );
+        y += 30;
+        b.choice(
             "Click album art",
             y,
             ID_ART_CLICK,
@@ -792,6 +801,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             ID_ART_CLICK => Some(|c| &mut c.art_click),
             ID_TITLE_CLICK => Some(|c| &mut c.title_click),
             ID_OUTPUT_CLICK => Some(|c| &mut c.output_click),
+            ID_VOLUME_TARGET => Some(|c| &mut c.volume_target),
             _ => None,
         };
         if let Some(field) = field {

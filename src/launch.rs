@@ -157,6 +157,22 @@ pub fn process_matches(pid: u32, app_id: &str) -> bool {
     }
 }
 
+/// The exe file name of a running process, for example "Spotify.exe".
+pub fn process_exe(pid: u32) -> Option<String> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut path = [0u16; 1024];
+        let mut len = path.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(process);
+        if !ok {
+            return None;
+        }
+        let full = String::from_utf16_lossy(&path[..len as usize]);
+        Path::new(&full).file_name().and_then(|n| n.to_str()).map(|n| n.to_string())
+    }
+}
+
 /// A readable name for an app id, for menus.
 pub fn display_name(app_id: &str) -> String {
     let lower = app_id.to_lowercase();

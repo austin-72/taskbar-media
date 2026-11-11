@@ -19,7 +19,7 @@ use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
 use crate::config::{
-    FONTS, ITEM_COUNT, ITEM_OUTPUT, ITEM_PLAYERS, ITEM_SEEK, ITEM_TITLE, ITEM_ART, ITEM_GEAR, ITEM_INFO, ITEM_NEXT, ITEM_PLAY, ITEM_PREV, ITEM_REPEAT,
+    FONTS, ITEM_COUNT, ITEM_OUTPUT, ITEM_PLAYERS, ITEM_SEEK, ITEM_TITLE, ITEM_VOLUME, ITEM_ART, ITEM_GEAR, ITEM_INFO, ITEM_NEXT, ITEM_PLAY, ITEM_PREV, ITEM_REPEAT,
     ITEM_SHUFFLE,
 };
 
@@ -35,7 +35,7 @@ impl Rect {
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }
-    fn cx(&self) -> f32 {
+    pub fn cx(&self) -> f32 {
         self.x + self.w / 2.0
     }
     fn cy(&self) -> f32 {
@@ -60,6 +60,8 @@ pub enum Hit {
     Output,
     PlayerUp,
     PlayerDown,
+    /// The volume button, which opens the mixer.
+    VolIcon,
     Title,
     Seek,
 }
@@ -120,6 +122,8 @@ pub struct Layout {
     /// The player switcher: an up arrow above a down arrow. Zero-sized when
     /// not shown.
     pub players: Rect,
+    /// The volume button (opens the mixer). Zero-sized when not shown.
+    pub vol_icon: Rect,
     /// The title sits above the seek bar, rather than each on its own.
     pub stacked: bool,
     pub row1: Rect,
@@ -194,6 +198,11 @@ impl Layout {
                 }
                 ITEM_SHUFFLE | ITEM_REPEAT => {
                     l.extras[usize::from(item == ITEM_REPEAT)] = Rect { x, y: by, w: ew, h: bh };
+                    x += ew;
+                    end_pad = (6.0 * u).round();
+                }
+                ITEM_VOLUME => {
+                    l.vol_icon = Rect { x, y: by, w: ew, h: bh };
                     x += ew;
                     end_pad = (6.0 * u).round();
                 }
@@ -291,6 +300,9 @@ impl Layout {
         if within(&self.output, 0.0) {
             return Hit::Output;
         }
+        if within(&self.vol_icon, 0.0) {
+            return Hit::VolIcon;
+        }
         if within(&self.row1, 0.0) && (!self.stacked || y < self.row2.y - 3.0 * self.u) {
             return Hit::Title;
         }
@@ -361,6 +373,13 @@ pub struct Frame {
     pub update: bool,
     /// The current output is headphones (changes the output button's icon).
     pub headphones: bool,
+    /// Level shown by the volume button's icon, as a percentage.
+    pub vol: u8,
+    pub vol_muted: bool,
+    /// The mixer is open (the volume button looks pressed).
+    pub mixer_open: bool,
+    /// The output device list is open (its button looks pressed).
+    pub outputs_open: bool,
 }
 
 /// A widget's album art, decoded and scaled to the size it is drawn at.
@@ -547,6 +566,267 @@ pub fn paint_card(hwnd: HWND, c: &Card, art: Option<&[u8]>, spotify: bool) {
     unsafe {
         render_to_window(hwnd, c.w, c.h, k, |g| draw_card(g, c, k, art, spotify));
     }
+}
+
+/// One row of the volume mixer popup.
+#[derive(Clone, Default, PartialEq)]
+pub struct MixerRow {
+    pub name: String,
+    /// Percentage.
+    pub level: u8,
+    pub muted: bool,
+}
+
+/// The volume mixer popup: the system volume, then one row per app.
+#[derive(Clone, Default, PartialEq)]
+pub struct Mixer {
+    pub scale: f32,
+    pub smooth: bool,
+    /// Light Windows theme: light panel with dark text.
+    pub light: bool,
+    pub font: u32,
+    /// Slider fill color (0xAARRGGBB), or 0 to use the text color.
+    pub accent: u32,
+    /// Row 0 is the system volume.
+    pub rows: Vec<MixerRow>,
+    /// Row under the mouse (-1 for none), and whether it is on the icon.
+    pub hover_row: i32,
+    pub hover_icon: bool,
+    /// Row whose slider is being dragged (-1 for none).
+    pub drag_row: i32,
+}
+
+/// Where a mixer row's parts are, in pixels within the popup.
+#[derive(Clone, Copy, Default)]
+pub struct MixerRowRects {
+    pub row: Rect,
+    /// The speaker icon: click to mute.
+    pub icon: Rect,
+    pub name: Rect,
+    pub track: Rect,
+    pub percent: Rect,
+}
+
+pub struct MixerLayout {
+    pub w: i32,
+    pub h: i32,
+    pub rows: Vec<MixerRowRects>,
+}
+
+/// Lay out the mixer popup for `n` rows at a DPI scale.
+pub fn mixer_layout(scale: f32, n: usize) -> MixerLayout {
+    let u = scale;
+    let pad = (10.0 * u).round();
+    let row_h = (34.0 * u).round();
+    let w = (340.0 * u).round();
+    // A little extra space, with a divider, under the system volume row.
+    let divider = if n > 1 { (9.0 * u).round() } else { 0.0 };
+    let mut rows = Vec::with_capacity(n);
+    for i in 0..n {
+        let y = pad + i as f32 * row_h + if i > 0 { divider } else { 0.0 };
+        let row = Rect { x: pad, y, w: w - 2.0 * pad, h: row_h };
+        let icon = Rect { x: pad, y: y + 3.0 * u, w: 28.0 * u, h: row_h - 6.0 * u };
+        let name = Rect { x: pad + 34.0 * u, y, w: 104.0 * u, h: row_h };
+        let percent = Rect { x: w - pad - 38.0 * u, y, w: 38.0 * u, h: row_h };
+        let track_x = name.x + name.w + 8.0 * u;
+        let th = (3.0 * u).round().max(2.0);
+        let track = Rect {
+            x: track_x,
+            y: (y + row_h / 2.0 - th / 2.0).round(),
+            w: (percent.x - 8.0 * u - track_x).max(20.0),
+            h: th,
+        };
+        rows.push(MixerRowRects { row, icon, name, track, percent });
+    }
+    let h = pad * 2.0 + n as f32 * row_h + divider;
+    MixerLayout { w: w as i32, h: h as i32, rows }
+}
+
+/// Draw the mixer popup into its layered window.
+pub fn paint_mixer(hwnd: HWND, m: &Mixer) {
+    let k = supersample(m.smooth, m.scale);
+    let layout = mixer_layout(m.scale, m.rows.len());
+    if layout.w <= 0 || layout.h <= 0 {
+        return;
+    }
+    let big = mixer_layout(m.scale * k as f32, m.rows.len());
+    unsafe {
+        render_to_window(hwnd, layout.w, layout.h, k, |g| draw_mixer(g, m, &big, k));
+    }
+}
+
+unsafe fn draw_mixer(g: *mut GpGraphics, m: &Mixer, l: &MixerLayout, k: i32) {
+    let u = m.scale * k as f32;
+    let (w, h) = (l.w as f32, l.h as f32);
+    let fg: u32 = if m.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
+    let dim = alpha(fg, 0x9E);
+    let accent = if m.accent != 0 { m.accent | 0xFF00_0000 } else { fg };
+    let family = FONTS[(m.font as usize).min(FONTS.len() - 1)];
+
+    GdipGraphicsClear(g, 0x0000_0000);
+    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+    GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+    GdipSetTextRenderingHint(
+        g,
+        if k > 1 { TextRenderingHintAntiAlias } else { TextRenderingHintAntiAliasGridFit },
+    );
+
+    let panel = Rect { x: 0.5 * u, y: 0.5 * u, w: w - u, h: h - u };
+    fill_round_color(g, if m.light { 0xFCF6_F6F6 } else { 0xFC26_2626 }, panel, 8.0 * u);
+    let mut pen: *mut GpPen = null_mut();
+    GdipCreatePen1(alpha(fg, 0x30), 1.0 * u, UnitPixel, &mut pen);
+    if !pen.is_null() {
+        stroke_round(g, pen, panel, 8.0 * u);
+        GdipDeletePen(pen);
+    }
+
+    let near = make_format(StringAlignmentNear, true);
+    let far = make_format(StringAlignmentFar, true);
+    let bold = make_font(family, 12.5 * u, true);
+    let regular = make_font(family, 12.5 * u, false);
+    let small = make_font(family, 11.0 * u, false);
+    for (i, (row, r)) in m.rows.iter().zip(&l.rows).enumerate() {
+        let hovered = m.hover_row == i as i32;
+        if i == 1 {
+            // Divider between the system volume and the apps.
+            let y = r.row.y - 5.0 * u;
+            let brush = solid(alpha(fg, 0x24));
+            GdipFillRectangle(g, brush, r.row.x, y, r.row.w, (1.0 * u).max(1.0));
+            GdipDeleteBrush(brush);
+        }
+        if hovered && m.hover_icon {
+            fill_round_color(g, alpha(fg, 0x1C), r.icon, 4.0 * u);
+        }
+        let icon_color = if hovered && m.hover_icon { fg } else { dim };
+        draw_speaker(g, r.icon.cx() - 1.0 * u, r.icon.cy(), u, icon_color, row.muted, row.level);
+        draw_text(g, &row.name, if i == 0 { bold } else { regular }, r.name, near, fg);
+        draw_text(g, &format!("{}%", row.level), small, r.percent, far, dim);
+
+        let t = r.track;
+        fill_round_color(g, alpha(fg, 0x3A), t, t.h / 2.0);
+        let fill = t.w * row.level.min(100) as f32 / 100.0;
+        if fill >= 1.0 {
+            let color = if row.muted { dim } else { accent };
+            fill_round_color(g, color, Rect { w: fill.max(t.h), ..t }, t.h / 2.0);
+        }
+        let dragging = m.drag_row == i as i32;
+        if dragging || (hovered && !m.hover_icon) {
+            let radius = if dragging { 6.0 * u } else { 5.0 * u };
+            let brush = solid(fg);
+            GdipFillEllipse(g, brush, t.x + fill - radius, t.cy() - radius, radius * 2.0, radius * 2.0);
+            GdipDeleteBrush(brush);
+        }
+    }
+    GdipDeleteFont(bold);
+    GdipDeleteFont(regular);
+    GdipDeleteFont(small);
+    GdipDeleteStringFormat(near);
+    GdipDeleteStringFormat(far);
+}
+
+/// One device in the output device popup.
+#[derive(Clone, Default, PartialEq)]
+pub struct PickerRow {
+    pub name: String,
+    pub headphones: bool,
+    /// Sound is playing through this one now.
+    pub current: bool,
+}
+
+/// The output device popup: a list of playback devices to choose from,
+/// styled like the mixer.
+#[derive(Clone, Default, PartialEq)]
+pub struct Picker {
+    pub scale: f32,
+    pub smooth: bool,
+    pub light: bool,
+    pub font: u32,
+    /// Color of the current device's tick (0xAARRGGBB), or 0 for the text
+    /// color.
+    pub accent: u32,
+    pub rows: Vec<PickerRow>,
+    /// Row under the mouse, or -1.
+    pub hover_row: i32,
+}
+
+/// Size of the output device popup and the rectangle of each row.
+pub fn picker_layout(scale: f32, n: usize) -> (i32, i32, Vec<Rect>) {
+    let u = scale;
+    let pad = (8.0 * u).round();
+    let row_h = (36.0 * u).round();
+    let w = (320.0 * u).round();
+    let rows = (0..n)
+        .map(|i| Rect { x: pad, y: pad + i as f32 * row_h, w: w - 2.0 * pad, h: row_h })
+        .collect();
+    (w as i32, (pad * 2.0 + n as f32 * row_h) as i32, rows)
+}
+
+/// Draw the output device popup into its layered window.
+pub fn paint_picker(hwnd: HWND, p: &Picker) {
+    let k = supersample(p.smooth, p.scale);
+    let (w, h, _) = picker_layout(p.scale, p.rows.len());
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    unsafe {
+        render_to_window(hwnd, w, h, k, |g| draw_picker(g, p, k));
+    }
+}
+
+unsafe fn draw_picker(g: *mut GpGraphics, p: &Picker, k: i32) {
+    let u = p.scale * k as f32;
+    let (w, h, rows) = picker_layout(u, p.rows.len());
+    let (w, h) = (w as f32, h as f32);
+    let fg: u32 = if p.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
+    let dim = alpha(fg, 0x9E);
+    let accent = if p.accent != 0 { p.accent | 0xFF00_0000 } else { fg };
+    let family = FONTS[(p.font as usize).min(FONTS.len() - 1)];
+
+    GdipGraphicsClear(g, 0x0000_0000);
+    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+    GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+    GdipSetTextRenderingHint(
+        g,
+        if k > 1 { TextRenderingHintAntiAlias } else { TextRenderingHintAntiAliasGridFit },
+    );
+
+    let panel = Rect { x: 0.5 * u, y: 0.5 * u, w: w - u, h: h - u };
+    fill_round_color(g, if p.light { 0xFCF6_F6F6 } else { 0xFC26_2626 }, panel, 8.0 * u);
+    let mut pen: *mut GpPen = null_mut();
+    GdipCreatePen1(alpha(fg, 0x30), 1.0 * u, UnitPixel, &mut pen);
+    if !pen.is_null() {
+        stroke_round(g, pen, panel, 8.0 * u);
+        GdipDeletePen(pen);
+    }
+
+    let near = make_format(StringAlignmentNear, true);
+    let bold = make_font(family, 12.5 * u, true);
+    let regular = make_font(family, 12.5 * u, false);
+    for (i, (row, r)) in p.rows.iter().zip(&rows).enumerate() {
+        if p.hover_row == i as i32 {
+            fill_round_color(g, alpha(fg, 0x1C), *r, 5.0 * u);
+        }
+        let color = if row.current || p.hover_row == i as i32 { fg } else { dim };
+        draw_output_icon(g, r.x + 18.0 * u, r.cy(), u, color, row.headphones);
+        let name = Rect { x: r.x + 38.0 * u, y: r.y, w: r.w - 38.0 * u - 30.0 * u, h: r.h };
+        draw_text(g, &row.name, if row.current { bold } else { regular }, name, near, color);
+        if row.current {
+            // A tick at the right-hand end.
+            let (cx, cy) = (r.x + r.w - 16.0 * u, r.cy());
+            let mut tick: *mut GpPen = null_mut();
+            GdipCreatePen1(accent, 1.8 * u, UnitPixel, &mut tick);
+            if !tick.is_null() {
+                GdipSetPenLineCap197819(tick, LineCapRound, LineCapRound, DashCapRound);
+                GdipSetPenLineJoin(tick, LineJoinRound);
+                GdipDrawLine(g, tick, cx - 5.0 * u, cy, cx - 1.5 * u, cy + 3.5 * u);
+                GdipDrawLine(g, tick, cx - 1.5 * u, cy + 3.5 * u, cx + 5.0 * u, cy - 3.5 * u);
+                GdipDeletePen(tick);
+            }
+        }
+    }
+    GdipDeleteFont(bold);
+    GdipDeleteFont(regular);
+    GdipDeleteStringFormat(near);
 }
 
 unsafe fn draw_card(g: *mut GpGraphics, c: &Card, k: i32, art: Option<&[u8]>, spotify: bool) {
@@ -897,45 +1177,23 @@ unsafe fn draw(
     // ---- output device ----------------------------------------------------
     if l.output.w > 0.0 {
         let b = l.output;
-        let u = u * l.b;
-        if f.hover == Hit::Output {
-            let c = if f.pressed == Hit::Output { plate_down } else { plate };
+        if f.outputs_open || f.hover == Hit::Output {
+            let c = if f.outputs_open || f.pressed == Hit::Output { plate_down } else { plate };
             fill_round_color(g, c, b, radius);
         }
-        let color = if f.hover == Hit::Output { primary } else { dim };
-        let (cx, cy) = (b.cx(), b.cy());
-        let brush = solid(color);
-        let mut pen: *mut GpPen = null_mut();
-        GdipCreatePen1(color, 1.5 * u, UnitPixel, &mut pen);
-        if !pen.is_null() {
-            GdipSetPenLineCap197819(pen, LineCapRound, LineCapRound, DashCapRound);
-            if f.headphones {
-                // A band over the top with an ear cup on each side.
-                GdipDrawArc(g, pen, cx - 5.5 * u, cy - 6.0 * u, 11.0 * u, 11.0 * u, 180.0, 180.0);
-                for side in [-1.0f32, 1.0] {
-                    let cup = Rect { x: cx + side * 5.0 * u - 1.6 * u, y: cy - 0.8 * u, w: 3.2 * u, h: 6.0 * u };
-                    fill_round(g, brush, cup, 1.4 * u);
-                }
-            } else {
-                // A speaker cone with two sound waves.
-                GdipFillRectangle(g, brush, cx - 6.5 * u, cy - 2.2 * u, 3.0 * u, 4.4 * u);
-                polygon(
-                    g,
-                    brush,
-                    &[
-                        (cx - 4.0 * u, cy - 2.2 * u),
-                        (cx - 0.5 * u, cy - 5.5 * u),
-                        (cx - 0.5 * u, cy + 5.5 * u),
-                        (cx - 4.0 * u, cy + 2.2 * u),
-                    ],
-                );
-                for r in [3.0 * u, 5.8 * u] {
-                    GdipDrawArc(g, pen, cx + 0.6 * u - r, cy - r, r * 2.0, r * 2.0, -42.0, 84.0);
-                }
-            }
-            GdipDeletePen(pen);
+        let color = if f.hover == Hit::Output || f.outputs_open { primary } else { dim };
+        draw_output_icon(g, b.cx(), b.cy(), u * l.b, color, f.headphones);
+    }
+
+    // ---- volume button ------------------------------------------------------
+    if l.vol_icon.w > 0.0 {
+        let b = l.vol_icon;
+        if f.mixer_open || f.hover == Hit::VolIcon {
+            let c = if f.mixer_open || f.pressed == Hit::VolIcon { plate_down } else { plate };
+            fill_round_color(g, c, b, radius);
         }
-        GdipDeleteBrush(brush);
+        let color = if f.hover == Hit::VolIcon || f.mixer_open { primary } else { dim };
+        draw_speaker(g, b.cx() - 1.0 * u * l.b, b.cy(), u * l.b, color, f.vol_muted, f.vol);
     }
 
     // ---- text and seek bar -------------------------------------------------
@@ -1092,6 +1350,63 @@ unsafe fn fill_round(g: *mut GpGraphics, brush: *mut GpBrush, r: Rect, radius: f
     GdipClosePathFigure(path);
     GdipFillPath(g, brush, path);
     GdipDeletePath(path);
+}
+
+/// Headphones, or a loudspeaker cabinet for any other kind of output. (The
+/// cone-and-waves shape is the volume icon.)
+unsafe fn draw_output_icon(g: *mut GpGraphics, cx: f32, cy: f32, u: f32, color: u32, headphones: bool) {
+    let brush = solid(color);
+    let mut pen: *mut GpPen = null_mut();
+    GdipCreatePen1(color, 1.5 * u, UnitPixel, &mut pen);
+    if !pen.is_null() {
+        GdipSetPenLineCap197819(pen, LineCapRound, LineCapRound, DashCapRound);
+        if headphones {
+            // A band over the top with an ear cup on each side.
+            GdipDrawArc(g, pen, cx - 5.5 * u, cy - 6.0 * u, 11.0 * u, 11.0 * u, 180.0, 180.0);
+            for side in [-1.0f32, 1.0] {
+                let cup = Rect { x: cx + side * 5.0 * u - 1.6 * u, y: cy - 0.8 * u, w: 3.2 * u, h: 6.0 * u };
+                fill_round(g, brush, cup, 1.4 * u);
+            }
+        } else {
+            // A box with a small and a large driver.
+            let cabinet = Rect { x: cx - 4.6 * u, y: cy - 6.5 * u, w: 9.2 * u, h: 13.0 * u };
+            stroke_round(g, pen, cabinet, 2.0 * u);
+            GdipFillEllipse(g, brush, cx - 1.1 * u, cy - 4.4 * u, 2.2 * u, 2.2 * u);
+            GdipFillEllipse(g, brush, cx - 2.5 * u, cy - 0.6 * u, 5.0 * u, 5.0 * u);
+        }
+        GdipDeletePen(pen);
+    }
+    GdipDeleteBrush(brush);
+}
+
+/// A speaker cone with sound waves for the level: none (a cross instead)
+/// when muted or at zero, one when quiet, two from half volume up.
+unsafe fn draw_speaker(g: *mut GpGraphics, cx: f32, cy: f32, u: f32, color: u32, muted: bool, level: u8) {
+    let brush = solid(color);
+    GdipFillRectangle(g, brush, cx - 6.0 * u, cy - 2.2 * u, 3.0 * u, 4.4 * u);
+    polygon(
+        g,
+        brush,
+        &[(cx - 3.5 * u, cy - 2.2 * u), (cx, cy - 5.5 * u), (cx, cy + 5.5 * u), (cx - 3.5 * u, cy + 2.2 * u)],
+    );
+    GdipDeleteBrush(brush);
+    let mut pen: *mut GpPen = null_mut();
+    GdipCreatePen1(color, 1.5 * u, UnitPixel, &mut pen);
+    if pen.is_null() {
+        return;
+    }
+    GdipSetPenLineCap197819(pen, LineCapRound, LineCapRound, DashCapRound);
+    if muted || level == 0 {
+        let (x0, x1, d) = (cx + 2.6 * u, cx + 6.6 * u, 2.0 * u);
+        GdipDrawLine(g, pen, x0, cy - d, x1, cy + d);
+        GdipDrawLine(g, pen, x0, cy + d, x1, cy - d);
+    } else {
+        let waves: &[f32] = if level >= 50 { &[3.0, 5.8] } else { &[3.0] };
+        for r in waves.iter().map(|r| r * u) {
+            GdipDrawArc(g, pen, cx + 1.1 * u - r, cy - r, r * 2.0, r * 2.0, -42.0, 84.0);
+        }
+    }
+    GdipDeletePen(pen);
 }
 
 unsafe fn stroke_round(g: *mut GpGraphics, pen: *mut GpPen, r: Rect, radius: f32) {

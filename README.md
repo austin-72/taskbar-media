@@ -9,9 +9,17 @@ Rest the mouse on it for a closer look at what is playing:
 
 ![The hover card](docs/card.png)
 
+The speaker button opens a volume mixer for the system and each app:
+
+![The volume mixer](docs/mixer.png)
+
+The optional output device button switches between speakers and headphones:
+
+![The output device list](docs/outputs.png)
+
 Nearly everything can be rearranged, hidden or restyled:
 
-![Five example layouts](docs/layouts.png)
+![Example layouts](docs/layouts.png)
 
 From left to right:
 
@@ -20,6 +28,7 @@ From left to right:
 - Shuffle, previous, play/pause, next, repeat (shuffle and repeat only when
   the player supports them)
 - Title and artist over a seek bar with elapsed / total time (click or drag)
+- A speaker button that opens the volume mixer
 
 It uses Windows' own media session API, so it works with anything that shows
 up in the Windows media flyout: Spotify (desktop and Store versions), browsers,
@@ -35,6 +44,8 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 - Right-click the widget or use the tray icon for settings (a settings
   button can be added to the widget in Settings, Layout)
 - Mouse wheel over the widget changes the player's own volume
+- Click the speaker button for a mixer with the system volume and every
+  app's own volume
 - Click the title to copy "Artist - Title"
 - With several players running, use the arrows left of the album art, or
   right-click and choose one under Player ("Automatic" hands the choice back)
@@ -55,7 +66,8 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
   highlight color, custom colors, album art shape, seek bar thickness,
   background, times, scrolling titles, hover card
 - **Behavior**: what the mouse wheel, a click on the album art, a click on
-  the title, and the output device button do
+  the title, and the output device button do, and which volume the speaker
+  icon reflects
 - **More**: export, import or reset all settings; version and releases
 
 Requires Windows 10 (1809 or later) or Windows 11, 64-bit, with the taskbar at
