@@ -761,8 +761,12 @@ impl App {
                 width: self.cfg.width,
                 show_times: self.cfg.show_times,
                 mini: false,
-                extra: self.snap.can_shuffle || self.snap.can_repeat,
-                players: self.snap.sessions.len() > 1,
+                // Buttons that cannot be used right now are shown greyed
+                // out, unless the user prefers them left out.
+                extra: !self.cfg.hide_unusable || self.snap.can_shuffle || self.snap.can_repeat,
+                players: !self.cfg.hide_unusable || self.snap.sessions.len() > 1,
+                gap: self.cfg.button_gap,
+                stack: self.cfg.stack_extras,
                 order: self.cfg.order(tb.primary),
                 button_size: self.cfg.button_size,
                 seek_size: self.cfg.seek_size,
@@ -1422,6 +1426,7 @@ impl App {
             vol_muted: self.volume.is_some_and(|(_, muted)| muted),
             mixer_open: self.mixer_open && self.popup == Popup::Mixer,
             outputs_open: self.mixer_open && self.popup == Popup::Outputs,
+            players_enabled: self.snap.sessions.len() > 1,
         };
         if widget.last_frame.as_ref() != Some(&frame) {
             let art = self.snap.art.clone();

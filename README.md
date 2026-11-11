@@ -23,10 +23,10 @@ Nearly everything can be rearranged, hidden or restyled:
 
 From left to right:
 
-- Up / down arrows to switch player, when more than one app is playing
+- Up / down arrows to switch player (greyed out with a single player)
 - Album art; click it to bring up the app that is playing
-- Shuffle, previous, play/pause, next, repeat (shuffle and repeat only when
-  the player supports them)
+- Shuffle, previous, play/pause, next, repeat (shuffle and repeat are greyed
+  out when the player does not support them)
 - Title and artist over a seek bar with elapsed / total time (click or drag)
 - A speaker button that opens the volume mixer
 
@@ -61,7 +61,9 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
   check, Spotify only, which taskbars to show on, keep clear of app icons
 - **Layout**: which items show and in what order (with the title and seek
   bar stacked, side by side, or on their own), a separate layout for other
-  displays, text width, button size, and what the text shows
+  displays, text width, button size and spacing, shuffle stacked above
+  repeat, what the text shows, and whether unusable buttons are greyed out
+  or hidden
 - **Appearance**: text size, font, text color, rendering (smooth or sharp),
   highlight color, custom colors, album art shape, seek bar thickness,
   background, times, scrolling titles, hover card

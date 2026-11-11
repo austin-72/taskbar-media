@@ -75,6 +75,15 @@ pub struct Config {
     pub art_click: u32,
     /// Clicking the title: 0 copies it, 1 opens the player, 2 nothing.
     pub title_click: u32,
+    /// Extra space between buttons: 0 compact, 1 normal, 2 roomy, 3 wide,
+    /// 4 extra wide.
+    pub button_gap: u32,
+    /// Shuffle above repeat in one column, when both are shown.
+    pub stack_extras: bool,
+    /// Leave out buttons that cannot be used right now (shuffle and repeat
+    /// for players without them, the player arrows with one player) rather
+    /// than showing them greyed out.
+    pub hide_unusable: bool,
     /// What the volume button's icon reflects: 0 the player's own volume,
     /// 1 the system volume.
     pub volume_target: u32,
@@ -265,6 +274,9 @@ impl Config {
             seek_size: d(w!("SeekSize"), 1, 2),
             background: d(w!("Background"), 0, 2),
             art_click: d(w!("ArtClick"), 0, 2),
+            button_gap: d(w!("ButtonGap"), 1, 4),
+            stack_extras: d(w!("StackExtras"), 0, 1) == 1,
+            hide_unusable: d(w!("HideUnusable"), 0, 1) == 1,
             volume_target: d(w!("VolumeTarget"), 0, 1),
             output_click: d(w!("OutputClick"), 0, 1),
             output_a: read_string(SETTINGS_KEY, w!("OutputA")).unwrap_or_default(),
@@ -307,6 +319,9 @@ impl Config {
         write_dword(SETTINGS_KEY, w!("Background"), self.background);
         write_dword(SETTINGS_KEY, w!("ArtClick"), self.art_click);
         write_dword(SETTINGS_KEY, w!("TitleClick"), self.title_click);
+        write_dword(SETTINGS_KEY, w!("ButtonGap"), self.button_gap);
+        write_dword(SETTINGS_KEY, w!("StackExtras"), self.stack_extras as u32);
+        write_dword(SETTINGS_KEY, w!("HideUnusable"), self.hide_unusable as u32);
         write_dword(SETTINGS_KEY, w!("VolumeTarget"), self.volume_target);
         write_dword(SETTINGS_KEY, w!("OutputClick"), self.output_click);
         write_string(SETTINGS_KEY, w!("OutputA"), &self.output_a);

@@ -92,6 +92,11 @@ pub struct LayoutParams {
     pub button_size: u32,
     /// 0 thin, 1 normal, 2 thick.
     pub seek_size: u32,
+    /// Space between buttons: 0 compact, 1 normal, 2 roomy, 3 wide,
+    /// 4 extra wide.
+    pub gap: u32,
+    /// Put shuffle above repeat in one column when both are shown.
+    pub stack: bool,
 }
 
 impl LayoutParams {
@@ -126,6 +131,8 @@ pub struct Layout {
     pub vol_icon: Rect,
     /// The title sits above the seek bar, rather than each on its own.
     pub stacked: bool,
+    /// Shuffle and repeat share a column, shuffle on top.
+    pub stacked_extras: bool,
     pub row1: Rect,
     pub row2: Rect,
     pub elapsed: Rect,
@@ -146,8 +153,11 @@ impl Layout {
         let art_size = (h - 12.0 * u).min(40.0 * u).max(12.0).round();
         let art_y = ((h - art_size) / 2.0).round();
         let gear_size = (14.0 * u).round();
-        let bw = (28.0 * u * bs).round();
-        let ew = (23.0 * u * bs).round();
+        // Each button sits in a cell; wider cells put more space between
+        // the icons.
+        let gap = [-5.0, 0.0, 5.0, 10.0, 16.0][p.gap.min(4) as usize] * u;
+        let bw = (28.0 * u * bs + gap).round().max(14.0 * u);
+        let ew = (23.0 * u * bs + gap).round().max(13.0 * u);
         let bh = art_size.min(32.0 * u * bs).round();
         let by = ((h - bh) / 2.0).round();
 
@@ -172,6 +182,7 @@ impl Layout {
             Some(&ITEM_GEAR) | Some(&ITEM_PLAYERS) => (3.0 * u).round(),
             _ => (6.0 * u).round(),
         };
+        let stack = p.stack && items.contains(&ITEM_SHUFFLE) && items.contains(&ITEM_REPEAT);
         let mut end_pad = 0.0;
         for item in items {
             end_pad = 0.0;
@@ -194,6 +205,18 @@ impl Layout {
                 ITEM_PREV | ITEM_PLAY | ITEM_NEXT => {
                     l.buttons[(item - ITEM_PREV) as usize] = Rect { x, y: by, w: bw, h: bh };
                     x += bw;
+                    end_pad = (6.0 * u).round();
+                }
+                // Stacked: one column where the first of the two would be,
+                // shuffle in the top half and repeat in the bottom.
+                ITEM_SHUFFLE | ITEM_REPEAT if stack => {
+                    if !l.stacked_extras {
+                        let half = (art_size / 2.0).round();
+                        l.extras[0] = Rect { x, y: art_y, w: ew, h: half };
+                        l.extras[1] = Rect { x, y: art_y + half, w: ew, h: art_size - half };
+                        l.stacked_extras = true;
+                        x += ew;
+                    }
                     end_pad = (6.0 * u).round();
                 }
                 ITEM_SHUFFLE | ITEM_REPEAT => {
@@ -292,9 +315,16 @@ impl Layout {
                 return [Hit::Prev, Hit::Play, Hit::Next][i];
             }
         }
-        for (i, b) in self.extras.iter().enumerate() {
-            if within(b, 0.0) {
-                return [Hit::Shuffle, Hit::Repeat][i];
+        if self.stacked_extras {
+            // One column: above the middle is shuffle, below is repeat.
+            if within(&self.extras[0], 0.0) {
+                return if y < self.extras[1].y { Hit::Shuffle } else { Hit::Repeat };
+            }
+        } else {
+            for (i, b) in self.extras.iter().enumerate() {
+                if within(b, 0.0) {
+                    return [Hit::Shuffle, Hit::Repeat][i];
+                }
             }
         }
         if within(&self.output, 0.0) {
@@ -380,6 +410,8 @@ pub struct Frame {
     pub mixer_open: bool,
     /// The output device list is open (its button looks pressed).
     pub outputs_open: bool,
+    /// More than one player is running, so the switcher arrows do something.
+    pub players_enabled: bool,
 }
 
 /// A widget's album art, decoded and scaled to the size it is drawn at.
@@ -998,12 +1030,18 @@ unsafe fn draw(
         let half = b.h / 2.0;
         for (kind, top, dir) in [(Hit::PlayerUp, b.y, -1.0f32), (Hit::PlayerDown, b.y + half, 1.0)] {
             let zone = Rect { x: b.x - u, y: top, w: b.w + 2.0 * u, h: half };
-            if f.hover == kind {
+            if f.players_enabled && f.hover == kind {
                 let c = if f.pressed == kind { plate_down } else { plate };
                 fill_round_color(g, c, zone, 3.0 * u);
             }
-            // A small triangle pointing up or down.
-            let brush = solid(if f.hover == kind { primary } else { dim });
+            // A small triangle pointing up or down; greyed with one player.
+            let brush = solid(if !f.players_enabled {
+                disabled
+            } else if f.hover == kind {
+                primary
+            } else {
+                dim
+            });
             let (cx, cy) = (zone.cx(), zone.cy());
             polygon(
                 g,
@@ -1124,10 +1162,12 @@ unsafe fn draw(
             if b.w <= 0.0 {
                 continue;
             }
-            let u = u * l.b;
+            // Stacked, each icon has half the height, so it is drawn smaller
+            // and without the "on" dot underneath (its color shows that).
+            let u = u * l.b * if l.stacked_extras { 0.76 } else { 1.0 };
             if enabled[i] && f.hover == kinds[i] {
                 let c = if f.pressed == kinds[i] { plate_down } else { plate };
-                fill_round_color(g, c, b, radius);
+                fill_round_color(g, c, b, radius.min(b.h / 2.0));
             }
             let color = if !enabled[i] {
                 disabled
@@ -1136,7 +1176,7 @@ unsafe fn draw(
             } else {
                 dim
             };
-            let (cx, cy) = (b.cx(), b.cy() - 1.0 * u);
+            let (cx, cy) = (b.cx(), b.cy() - if l.stacked_extras { 0.0 } else { 1.0 * u });
             let mut pen: *mut GpPen = null_mut();
             GdipCreatePen1(color, 1.5 * u, UnitPixel, &mut pen);
             let brush = solid(color);
@@ -1166,7 +1206,7 @@ unsafe fn draw(
                 }
                 GdipDeletePen(pen);
             }
-            if enabled[i] && active[i] {
+            if enabled[i] && active[i] && !l.stacked_extras {
                 let d = 1.3 * u;
                 GdipFillEllipse(g, brush, cx - d, cy + 7.2 * u, d * 2.0, d * 2.0);
             }

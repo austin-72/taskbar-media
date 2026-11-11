@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.7.0
+
+### Added
+- Button spacing setting: compact, normal, roomy, wide or extra wide.
+- Option to stack shuffle above repeat in a single column.
+
+### Changed
+- Buttons that cannot be used right now are shown greyed out instead of
+  disappearing: shuffle and repeat with players that lack them, and the
+  player arrows when only one player is running. The widget no longer
+  changes width as these come and go. The old behaviour is available as
+  "Hide buttons that can't be used" in Settings, Layout.
+
 ## 1.6.0
 
 ### Added

@@ -55,6 +55,9 @@ const ID_OUTPUT_A: i32 = 137;
 const ID_OUTPUT_B: i32 = 138;
 const ID_LAYOUT_TARGET: i32 = 139;
 const ID_VOLUME_TARGET: i32 = 145;
+const ID_BUTTON_GAP: i32 = 146;
+const ID_STACK: i32 = 109;
+const ID_HIDE_UNUSABLE: i32 = 160;
 const ID_LAYOUT2: i32 = 107;
 const ID_HOVER: i32 = 108;
 const ID_TEXT_RGB: i32 = 124;
@@ -101,7 +104,7 @@ const LBN_SELCHANGE: u32 = 1;
 // Window layout at 96 dpi: a tab strip, the tab's controls, a row of buttons.
 const CLIENT_W: i32 = 400;
 const TOP: i32 = 48;
-const BUTTONS_Y: i32 = 482;
+const BUTTONS_Y: i32 = 526;
 const CLIENT_H: i32 = BUTTONS_Y + 28 + 14;
 const TAB_NAMES: [&str; 5] = ["General", "Layout", "Appearance", "Behavior", "More"];
 
@@ -474,8 +477,8 @@ pub fn open(module: HINSTANCE) {
         b.button("Reset layout", 242, y + 130, 142, ID_ITEM_RESET, false);
         y += 164;
         b.text(
-            "Shuffle and repeat need a player that supports them. \"Title over seek bar\" \
-             replaces the two separate items when it is shown.",
+            "\"Title over seek bar\" replaces the two separate title and seek bar items \
+             when it is shown.",
             y,
             36,
         );
@@ -483,6 +486,14 @@ pub fn open(module: HINSTANCE) {
         b.choice("Text width", y, ID_WIDTH, &["Compact", "Normal", "Wide"], cfg.width);
         y += 30;
         b.choice("Button size", y, ID_BUTTON_SIZE, &["Small", "Medium", "Large"], cfg.button_size);
+        y += 30;
+        b.choice(
+            "Button spacing",
+            y,
+            ID_BUTTON_GAP,
+            &["Compact", "Normal", "Roomy", "Wide", "Extra wide"],
+            cfg.button_gap,
+        );
         y += 30;
         b.choice(
             "Text",
@@ -497,6 +508,16 @@ pub fn open(module: HINSTANCE) {
             ],
             cfg.text_layout,
         );
+        y += 34;
+        b.checkbox("Stack shuffle above repeat in one column", y, ID_STACK, cfg.stack_extras);
+        y += 26;
+        b.checkbox(
+            "Hide buttons that can't be used (otherwise shown greyed out)",
+            y,
+            ID_HIDE_UNUSABLE,
+            cfg.hide_unusable,
+        );
+        debug_assert!(y + 22 <= BUTTONS_Y - 10);
 
         // ---- Appearance -------------------------------------------------
         b.tab.set(2);
@@ -792,6 +813,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             ID_COLOR => Some(|c| &mut c.text_color),
             ID_WHEEL => Some(|c| &mut c.wheel_mode),
             ID_BUTTON_SIZE => Some(|c| &mut c.button_size),
+            ID_BUTTON_GAP => Some(|c| &mut c.button_gap),
             ID_TEXT_LAYOUT => Some(|c| &mut c.text_layout),
             ID_FONT => Some(|c| &mut c.font),
             ID_ACCENT => Some(|c| &mut c.accent_mode),
@@ -919,6 +941,14 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
         (ID_LAYOUT_TARGET, CBN_SELCHANGE) => {
             LAYOUT_TARGET.with(|t| t.set(selection(hwnd, id).min(1)));
             fill_items(hwnd, &crate::current_config(), 0);
+        }
+        (ID_STACK, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.stack_extras = v);
+        }
+        (ID_HIDE_UNUSABLE, BN_CLICKED) => {
+            let v = checked(hwnd, id);
+            crate::update_config(|c| c.hide_unusable = v);
         }
         (ID_HOVER, BN_CLICKED) => {
             let v = checked(hwnd, id);
