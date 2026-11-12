@@ -459,15 +459,15 @@ fn supersample(smooth: bool, scale: f32) -> i32 {
     }
 }
 
-/// Let `draw` paint a picture `k` times larger than `w` x `h`, average it
-/// down, and show it in the layered window `hwnd`.
-unsafe fn render_to_window<R: Default>(
-    hwnd: HWND,
+/// Let `draw` paint a picture `k` times larger than `w` x `h` and average
+/// it down. Returns the `w` x `h` pixels (premultiplied ARGB, top row first)
+/// and whatever `draw` returned.
+unsafe fn render_pixels<R: Default>(
     w: i32,
     h: i32,
     k: i32,
     draw: impl FnOnce(*mut GpGraphics) -> R,
-) -> R {
+) -> Option<(Vec<u32>, R)> {
     let (bw, bh) = (w * k, h * k);
     let mut big = vec![0u32; (bw * bh) as usize];
     let mut bitmap: *mut GpBitmap = null_mut();
@@ -480,7 +480,7 @@ unsafe fn render_to_window<R: Default>(
         &mut bitmap,
     );
     if bitmap.is_null() {
-        return R::default();
+        return None;
     }
     let mut result = R::default();
     let mut g: *mut GpGraphics = null_mut();
@@ -491,7 +491,21 @@ unsafe fn render_to_window<R: Default>(
         GdipDeleteGraphics(g);
     }
     GdipDisposeImage(bitmap as *mut GpImage);
+    let mut out = vec![0u32; (w * h) as usize];
+    downsample(&big, bw as usize, &mut out, w as usize, h as usize, k as usize);
+    Some((out, result))
+}
 
+/// Draw with `draw` (see `render_pixels`) and show the result in the layered
+/// window `hwnd`.
+unsafe fn render_to_window<R: Default>(
+    hwnd: HWND,
+    w: i32,
+    h: i32,
+    k: i32,
+    draw: impl FnOnce(*mut GpGraphics) -> R,
+) -> R {
+    let Some((pixels, result)) = render_pixels(w, h, k, draw) else { return R::default() };
     let screen = GetDC(None);
     let mem = CreateCompatibleDC(Some(screen));
     let bmi = BITMAPINFO {
@@ -510,9 +524,7 @@ unsafe fn render_to_window<R: Default>(
         CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
     {
         if !bits.is_null() {
-            let out = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
-            downsample(&big, bw as usize, out, w as usize, h as usize, k as usize);
-
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
             let old = SelectObject(mem, dib.into());
             let size = SIZE { cx: w, cy: h };
             let origin = POINT::default();
@@ -540,6 +552,28 @@ unsafe fn render_to_window<R: Default>(
     let _ = DeleteDC(mem);
     ReleaseDC(None, screen);
     result
+}
+
+/// Draw `f` as it would appear on a taskbar of color `background`
+/// (0xRRGGBB), for the preview in the settings window. Returns opaque
+/// 0x00RRGGBB pixels, `f.w` x `f.h`, top row first.
+pub fn render_preview(f: &Frame, art: Option<&[u8]>, spotify: bool, background: u32) -> Vec<u32> {
+    if f.w <= 0 || f.h <= 0 {
+        return Vec::new();
+    }
+    let k = supersample(f.smooth, f.params.scale);
+    let layout = Layout::new(&f.params.scaled(k));
+    let mut cache = None;
+    let pixels = unsafe { render_pixels(f.w, f.h, k, |g| draw(g, f, &layout, k, &mut cache, art, spotify)) };
+    let Some((mut pixels, _)) = pixels else { return Vec::new() };
+    // Premultiplied "over" onto the solid background.
+    let (br, bg, bb) = ((background >> 16) & 0xFF, (background >> 8) & 0xFF, background & 0xFF);
+    for px in &mut pixels {
+        let inverse = 255 - (*px >> 24);
+        let mix = |fore: u32, back: u32| (fore + (back * inverse + 127) / 255).min(255);
+        *px = (mix((*px >> 16) & 0xFF, br) << 16) | (mix((*px >> 8) & 0xFF, bg) << 8) | mix(*px & 0xFF, bb);
+    }
+    pixels
 }
 
 /// Draw `f` and push it to the layered window. Returns how many pixels wider
@@ -754,6 +788,219 @@ unsafe fn draw_mixer(g: *mut GpGraphics, m: &Mixer, l: &MixerLayout, k: i32) {
     GdipDeleteFont(small);
     GdipDeleteStringFormat(near);
     GdipDeleteStringFormat(far);
+}
+
+/// What to take a picture of with `snapshot`.
+pub enum Shot<'a> {
+    Card(&'a Card, Option<&'a [u8]>, bool),
+    Mixer(&'a Mixer),
+    Picker(&'a Picker),
+    Menu(&'a MenuPanel),
+}
+
+/// Draw one of the popups exactly as it appears on screen, but into memory.
+/// Returns premultiplied ARGB pixels with their width and height.
+pub fn snapshot(shot: Shot) -> Option<(Vec<u32>, i32, i32)> {
+    unsafe {
+        match shot {
+            Shot::Card(c, art, spotify) => {
+                let k = supersample(c.smooth, c.scale);
+                render_pixels(c.w, c.h, k, |g| draw_card(g, c, k, art, spotify)).map(|(p, _)| (p, c.w, c.h))
+            }
+            Shot::Mixer(m) => {
+                let k = supersample(m.smooth, m.scale);
+                let layout = mixer_layout(m.scale, m.rows.len());
+                let big = mixer_layout(m.scale * k as f32, m.rows.len());
+                render_pixels(layout.w, layout.h, k, |g| draw_mixer(g, m, &big, k)).map(|(p, _)| (p, layout.w, layout.h))
+            }
+            Shot::Picker(p) => {
+                let k = supersample(p.smooth, p.scale);
+                let (w, h, _) = picker_layout(p.scale, p.rows.len());
+                render_pixels(w, h, k, |g| draw_picker(g, p, k)).map(|(px, _)| (px, w, h))
+            }
+            Shot::Menu(m) => {
+                let k = supersample(m.smooth, m.scale);
+                let kinds: Vec<u8> = m.rows.iter().map(|r| r.kind).collect();
+                let (w, h, _) = menu_layout(m.scale, &kinds);
+                render_pixels(w, h, k, |g| draw_menu(g, m, &kinds, k)).map(|(px, _)| (px, w, h))
+            }
+        }
+    }
+}
+
+/// Save a picture as a PNG file: `pixels` (premultiplied ARGB, or opaque
+/// with a zero alpha byte when `opaque`) are placed on a `background`
+/// (0xRRGGBB) canvas with `pad` pixels of margin on every side.
+pub fn save_png(
+    path: &std::path::Path,
+    pixels: &[u32],
+    w: i32,
+    h: i32,
+    opaque: bool,
+    background: u32,
+    pad: i32,
+) -> bool {
+    if w <= 0 || h <= 0 || pixels.len() < (w * h) as usize {
+        return false;
+    }
+    let (cw, ch) = (w + 2 * pad, h + 2 * pad);
+    let (br, bg, bb) = ((background >> 16) & 0xFF, (background >> 8) & 0xFF, background & 0xFF);
+    let mut canvas = vec![0xFF00_0000 | (background & 0x00FF_FFFF); (cw * ch) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let px = pixels[(y * w + x) as usize];
+            let out = if opaque {
+                px & 0x00FF_FFFF
+            } else {
+                let inverse = 255 - (px >> 24);
+                let mix = |fore: u32, back: u32| (fore + (back * inverse + 127) / 255).min(255);
+                (mix((px >> 16) & 0xFF, br) << 16) | (mix((px >> 8) & 0xFF, bg) << 8) | mix(px & 0xFF, bb)
+            };
+            canvas[((y + pad) * cw + x + pad) as usize] = 0xFF00_0000 | out;
+        }
+    }
+    // The PNG encoder that ships with GDI+.
+    const PNG: windows::core::GUID = windows::core::GUID::from_u128(0x557cf406_1a04_11d3_9a73_0000f81ef32e);
+    const PixelFormat32bppRGB: i32 = 0x0002_2009;
+    unsafe {
+        let mut bitmap: *mut GpBitmap = null_mut();
+        GdipCreateBitmapFromScan0(cw, ch, cw * 4, PixelFormat32bppRGB, Some(canvas.as_ptr() as *const u8), &mut bitmap);
+        if bitmap.is_null() {
+            return false;
+        }
+        let name = HSTRING::from(path.as_os_str());
+        let status = GdipSaveImageToFile(bitmap as *mut GpImage, &name, &PNG, std::ptr::null());
+        GdipDisposeImage(bitmap as *mut GpImage);
+        status == Status(0)
+    }
+}
+
+/// One row of the right-click menu popup.
+#[derive(Clone, Default, PartialEq)]
+pub struct MenuItem {
+    pub text: String,
+    /// 0 a command, 1 a section heading, 2 a dividing line.
+    pub kind: u8,
+    /// Mark it as the current choice.
+    pub tick: bool,
+    /// Draw it in the highlight color (used for "update available").
+    pub strong: bool,
+}
+
+/// The right-click menu, styled like the mixer.
+#[derive(Clone, Default, PartialEq)]
+pub struct MenuPanel {
+    pub scale: f32,
+    pub smooth: bool,
+    pub light: bool,
+    pub font: u32,
+    /// Highlight color (0xAARRGGBB), or 0 for the text color.
+    pub accent: u32,
+    pub rows: Vec<MenuItem>,
+    /// Row under the mouse, or -1.
+    pub hover_row: i32,
+}
+
+/// Size of the menu popup and the rectangle of each row. `kinds` holds each
+/// row's `MenuItem::kind`.
+pub fn menu_layout(scale: f32, kinds: &[u8]) -> (i32, i32, Vec<Rect>) {
+    let u = scale;
+    let pad = (6.0 * u).round();
+    let w = (250.0 * u).round();
+    let mut y = pad;
+    let mut rows = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let h = (match kind {
+            1 => 24.0,
+            2 => 9.0,
+            _ => 30.0,
+        } * u)
+            .round();
+        rows.push(Rect { x: pad, y, w: w - 2.0 * pad, h });
+        y += h;
+    }
+    (w as i32, (y + pad) as i32, rows)
+}
+
+/// Draw the menu popup into its layered window.
+pub fn paint_menu(hwnd: HWND, m: &MenuPanel) {
+    let k = supersample(m.smooth, m.scale);
+    let kinds: Vec<u8> = m.rows.iter().map(|r| r.kind).collect();
+    let (w, h, _) = menu_layout(m.scale, &kinds);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    unsafe {
+        render_to_window(hwnd, w, h, k, |g| draw_menu(g, m, &kinds, k));
+    }
+}
+
+unsafe fn draw_menu(g: *mut GpGraphics, m: &MenuPanel, kinds: &[u8], k: i32) {
+    let u = m.scale * k as f32;
+    let (w, h, rows) = menu_layout(u, kinds);
+    let (w, h) = (w as f32, h as f32);
+    let fg: u32 = if m.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
+    let dim = alpha(fg, 0x9E);
+    let accent = if m.accent != 0 { m.accent | 0xFF00_0000 } else { fg };
+    let family = FONTS[(m.font as usize).min(FONTS.len() - 1)];
+
+    GdipGraphicsClear(g, 0x0000_0000);
+    GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+    GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
+    GdipSetTextRenderingHint(
+        g,
+        if k > 1 { TextRenderingHintAntiAlias } else { TextRenderingHintAntiAliasGridFit },
+    );
+
+    let panel = Rect { x: 0.5 * u, y: 0.5 * u, w: w - u, h: h - u };
+    fill_round_color(g, if m.light { 0xFCF6_F6F6 } else { 0xFC26_2626 }, panel, 8.0 * u);
+    let mut pen: *mut GpPen = null_mut();
+    GdipCreatePen1(alpha(fg, 0x30), 1.0 * u, UnitPixel, &mut pen);
+    if !pen.is_null() {
+        stroke_round(g, pen, panel, 8.0 * u);
+        GdipDeletePen(pen);
+    }
+
+    let near = make_format(StringAlignmentNear, true);
+    let regular = make_font(family, 12.5 * u, false);
+    let bold = make_font(family, 12.5 * u, true);
+    let small = make_font(family, 10.5 * u, true);
+    for (i, (row, r)) in m.rows.iter().zip(&rows).enumerate() {
+        match row.kind {
+            2 => {
+                let brush = solid(alpha(fg, 0x24));
+                GdipFillRectangle(g, brush, r.x + 4.0 * u, r.cy() - 0.5 * u, r.w - 8.0 * u, (1.0 * u).max(1.0));
+                GdipDeleteBrush(brush);
+            }
+            1 => {
+                let label = Rect { x: r.x + 10.0 * u, y: r.y + 2.0 * u, w: r.w - 20.0 * u, h: r.h - 2.0 * u };
+                draw_text(g, &row.text, small, label, near, dim);
+            }
+            _ => {
+                if m.hover_row == i as i32 {
+                    fill_round_color(g, alpha(fg, 0x1C), *r, 5.0 * u);
+                }
+                let color = if row.strong { accent } else { fg };
+                let label = Rect { x: r.x + 10.0 * u, y: r.y, w: r.w - 20.0 * u - 22.0 * u, h: r.h };
+                draw_text(g, &row.text, if row.tick || row.strong { bold } else { regular }, label, near, color);
+                if row.tick {
+                    let (cx, cy) = (r.x + r.w - 16.0 * u, r.cy());
+                    let mut tick: *mut GpPen = null_mut();
+                    GdipCreatePen1(accent, 1.8 * u, UnitPixel, &mut tick);
+                    if !tick.is_null() {
+                        GdipSetPenLineCap197819(tick, LineCapRound, LineCapRound, DashCapRound);
+                        GdipDrawLine(g, tick, cx - 5.0 * u, cy, cx - 1.5 * u, cy + 3.5 * u);
+                        GdipDrawLine(g, tick, cx - 1.5 * u, cy + 3.5 * u, cx + 5.0 * u, cy - 3.5 * u);
+                        GdipDeletePen(tick);
+                    }
+                }
+            }
+        }
+    }
+    GdipDeleteFont(regular);
+    GdipDeleteFont(bold);
+    GdipDeleteFont(small);
+    GdipDeleteStringFormat(near);
 }
 
 /// One device in the output device popup.

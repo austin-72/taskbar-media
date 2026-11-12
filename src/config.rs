@@ -224,6 +224,51 @@ impl Config {
         order
     }
 
+    /// Replace the layout (the other taskbars' one if `other`) and the
+    /// options that shape it with a ready-made arrangement: 1 default,
+    /// 2 minimal, 3 compact, 4 everything, 5 classic.
+    pub fn apply_preset(&mut self, preset: usize, other: bool) {
+        // The given items shown in that order, everything else hidden.
+        let showing = |shown: &[u8]| {
+            let mut layout: Vec<(u8, bool)> = shown.iter().map(|item| (*item, true)).collect();
+            layout.extend(ITEMS.iter().filter(|(item, _, _)| !shown.contains(item)).map(|(item, _, _)| (*item, false)));
+            layout
+        };
+        let (layout, width, gap) = match preset {
+            2 => (showing(&[ITEM_ART, ITEM_PLAY, ITEM_TITLE]), 0, 1),
+            3 => (showing(&[ITEM_ART, ITEM_PREV, ITEM_PLAY, ITEM_NEXT, ITEM_INFO, ITEM_VOLUME]), 0, 0),
+            4 => (
+                showing(&[
+                    ITEM_PLAYERS,
+                    ITEM_ART,
+                    ITEM_SHUFFLE,
+                    ITEM_PREV,
+                    ITEM_PLAY,
+                    ITEM_NEXT,
+                    ITEM_REPEAT,
+                    ITEM_INFO,
+                    ITEM_VOLUME,
+                    ITEM_OUTPUT,
+                    ITEM_GEAR,
+                ]),
+                1,
+                1,
+            ),
+            5 => (showing(&[ITEM_GEAR, ITEM_ART, ITEM_PREV, ITEM_PLAY, ITEM_NEXT, ITEM_INFO]), 1, 1),
+            _ => (default_layout(true), 1, 1),
+        };
+        if other {
+            self.layout2 = layout;
+        } else {
+            self.layout = layout;
+        }
+        self.width = width;
+        self.button_gap = gap;
+        self.button_size = 1;
+        self.stack_extras = false;
+        self.text_layout = 0;
+    }
+
     /// Whether an item is on any taskbar's widget.
     pub fn shows(&self, item: u8) -> bool {
         self.order(true).contains(&item) || self.order(false).contains(&item)

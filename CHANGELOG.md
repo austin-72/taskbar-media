@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.8.0
+
+### Added
+- Live preview at the top of the settings window: the widget as it will
+  look, updating as you change settings.
+- Drag items in the layout list to reorder them.
+- Layout presets: Default, Minimal, Compact, Everything and Classic.
+- A restyled right-click menu matching the mixer and device list, with new
+  entries for copying the track name and opening the volume mixer and
+  output device list.
+- The widget restarts itself if it ever crashes, and records what happened
+  in a log file (Settings, More, "Open the log folder").
+- "Save pictures of the widget" (Settings, More) writes PNG images of the
+  widget and its popups, drawn by the app itself, for sharing or bug reports.
+
+### Changed
+- "Text width" and "Text" moved from the Layout tab to Appearance.
+
 ## 1.7.0
 
 ### Added

@@ -12,6 +12,7 @@
 #![windows_subsystem = "windows"]
 
 mod config;
+mod crash;
 mod devices;
 mod launch;
 mod media;
@@ -24,7 +25,7 @@ mod update;
 mod volume;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -75,8 +76,6 @@ const WIDGET_CLASS: PCWSTR = w!("TaskbarMediaWidget");
 static CONTROLLER_HWND: AtomicIsize = AtomicIsize::new(0);
 /// The "TaskbarCreated" message Explorer broadcasts when it (re)starts.
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
-/// A popup menu is showing, so the hover card should stay out of the way.
-static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -92,6 +91,19 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 /// Used by the settings window.
 pub fn current_config() -> Config {
     with_app(|a| a.cfg.clone()).unwrap_or_else(Config::load)
+}
+
+/// Save pictures of the widget and its popups as PNG files in a "pictures"
+/// folder beside the exe. Returns the folder and how many were saved.
+pub fn save_pictures() -> Option<(std::path::PathBuf, usize)> {
+    let dir = std::env::current_exe().ok()?.parent()?.join("pictures");
+    let saved = with_app(|a| a.save_pictures(&dir))?;
+    Some((dir, saved))
+}
+
+/// A picture of the widget for the settings window (see `App::preview`).
+pub fn preview(max_w: i32, other_taskbars: bool) -> Option<(Vec<u32>, i32, i32, u32)> {
+    with_app(|a| a.preview(max_w, other_taskbars)).flatten()
 }
 
 /// Re-read every setting from the registry and apply it (after an import or
@@ -194,6 +206,9 @@ struct App {
     outputs_current: String,
     outputs_hover: Option<usize>,
     outputs_frame: Option<render::Picker>,
+    menu_rows: Vec<MenuRow>,
+    menu_hover: Option<usize>,
+    menu_frame: Option<render::MenuPanel>,
     mixer_rows: Vec<volume::MixerEntry>,
     mixer_hover: Option<(usize, MixerPart)>,
     mixer_drag: Option<usize>,
@@ -219,6 +234,35 @@ enum Popup {
     Mixer,
     /// The list of output devices.
     Outputs,
+    /// The right-click menu.
+    Menu,
+}
+
+/// What a row of the right-click menu does.
+#[derive(Clone, PartialEq)]
+enum MenuCmd {
+    None,
+    Update,
+    Open,
+    Copy,
+    /// Let the widget choose which player to follow.
+    Auto,
+    /// Follow the player with this app id.
+    Player(String),
+    Mixer,
+    Outputs,
+    Settings,
+    Exit,
+}
+
+#[derive(Clone)]
+struct MenuRow {
+    text: String,
+    /// 0 a command, 1 a section heading, 2 a dividing line.
+    kind: u8,
+    tick: bool,
+    strong: bool,
+    cmd: MenuCmd,
 }
 
 /// A part of a row in the volume mixer popup.
@@ -236,6 +280,21 @@ enum Action {
     Settings,
     /// Switch between the two chosen output devices.
     ToggleOutput,
+    /// Open the releases page in the browser.
+    Releases,
+    Exit,
+}
+
+/// Carry out what a click asked for. Call with the app state released.
+fn perform(action: Action, module: HINSTANCE) {
+    match action {
+        Action::None => {}
+        Action::Open(app_id) => launch::open_app(&app_id),
+        Action::Settings => settings::open(module),
+        Action::ToggleOutput => toggle_output(),
+        Action::Releases => open_releases_page(),
+        Action::Exit => unsafe { PostQuitMessage(0) },
+    }
 }
 
 fn window_rect(hwnd: HWND) -> Option<RECT> {
@@ -713,7 +772,6 @@ impl App {
 
         let mut reserved = false;
         let showable = self.snap.active && !(self.cfg.hide_paused && !self.snap.playing);
-        let time_chars = format_time(self.snap.end - self.snap.start).len();
         for i in 0..self.widgets.len() {
             let Some(tb) = bars.iter().find(|b| b.hwnd == self.widgets[i].taskbar).copied() else {
                 continue;
@@ -753,24 +811,7 @@ impl App {
                 .map(|x| (right - x) as f32 - 8.0 * scale);
 
             // Use the chosen width, or the widest smaller one that fits.
-            let base = LayoutParams {
-                height: tb_h,
-                scale,
-                time_chars,
-                text_size: self.cfg.text_size,
-                width: self.cfg.width,
-                show_times: self.cfg.show_times,
-                mini: false,
-                // Buttons that cannot be used right now are shown greyed
-                // out, unless the user prefers them left out.
-                extra: !self.cfg.hide_unusable || self.snap.can_shuffle || self.snap.can_repeat,
-                players: !self.cfg.hide_unusable || self.snap.sessions.len() > 1,
-                gap: self.cfg.button_gap,
-                stack: self.cfg.stack_extras,
-                order: self.cfg.order(tb.primary),
-                button_size: self.cfg.button_size,
-                seek_size: self.cfg.seek_size,
-            };
+            let base = self.layout_params(tb_h, scale, tb.primary);
             let mut params = base;
             let mut layout = Layout::new(&params);
             if let Some(room) = room {
@@ -896,12 +937,80 @@ impl App {
         if i >= self.widgets.len() {
             return;
         }
-        self.popup = kind;
         let widget = &self.widgets[i];
         let (wx, wy, _, wh) = widget.rect;
         let button = if kind == Popup::Mixer { widget.layout.vol_icon } else { widget.layout.output };
-        self.mixer_scale = widget.params.scale.max(0.5);
-        self.mixer_anchor = (wx + button.cx() as i32, wy, wy + wh);
+        let anchor = (wx + button.cx() as i32, wy, wy + wh);
+        let scale = widget.params.scale.max(0.5);
+        self.open_popup(kind, anchor, scale);
+    }
+
+    /// Open the right-click menu at the mouse: above widget `i`, or, from
+    /// the tray icon, above the mouse itself.
+    fn open_menu(&mut self, i: Option<usize>) {
+        if self.mixer_open {
+            self.close_mixer();
+        }
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let widget = i.and_then(|i| self.widgets.get(i));
+        let anchor = match widget {
+            Some(w) => (pt.x, w.rect.1, w.rect.1 + w.rect.3),
+            None => (pt.x, pt.y - 10, pt.y + 10),
+        };
+        let scale = widget
+            .or(self.widgets.first())
+            .map(|w| w.params.scale)
+            .filter(|s| *s > 0.0)
+            .unwrap_or_else(|| unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96) as f32 / 96.0);
+        self.open_popup(Popup::Menu, anchor, scale.max(0.5));
+    }
+
+    /// The rows of the right-click menu for the current state.
+    fn build_menu(&self) -> Vec<MenuRow> {
+        let item = |text: &str, cmd: MenuCmd| MenuRow { text: text.to_string(), kind: 0, tick: false, strong: false, cmd };
+        let divider = || MenuRow { text: String::new(), kind: 2, tick: false, strong: false, cmd: MenuCmd::None };
+        let mut rows = Vec::new();
+        if let Some(version) = update::available() {
+            rows.push(MenuRow { strong: true, ..item(&format!("Get version {version}"), MenuCmd::Update) });
+            rows.push(divider());
+        }
+        if self.snap.active {
+            rows.push(item(&format!("Open {}", launch::display_name(&self.snap.app_id)), MenuCmd::Open));
+            if !self.snap.title.is_empty() {
+                rows.push(item("Copy track name", MenuCmd::Copy));
+            }
+            rows.push(divider());
+        }
+        // With more than one player around, let the user pick.
+        if self.snap.sessions.len() > 1 {
+            let preferred = media::preferred();
+            rows.push(MenuRow { kind: 1, ..item("PLAYER", MenuCmd::None) });
+            rows.push(MenuRow { tick: preferred.is_none(), ..item("Automatic", MenuCmd::Auto) });
+            for id in self.snap.sessions.iter().take(12) {
+                rows.push(MenuRow {
+                    tick: preferred.as_ref() == Some(id),
+                    ..item(&launch::display_name(id), MenuCmd::Player(id.clone()))
+                });
+            }
+            rows.push(divider());
+        }
+        rows.push(item("Volume mixer", MenuCmd::Mixer));
+        rows.push(item("Output device", MenuCmd::Outputs));
+        rows.push(divider());
+        rows.push(item("Settings", MenuCmd::Settings));
+        rows.push(item("Exit", MenuCmd::Exit));
+        rows
+    }
+
+    /// Show the popup as `kind`, hanging from `anchor` (centre x, and the
+    /// top and bottom of whatever it belongs to).
+    fn open_popup(&mut self, kind: Popup, anchor: (i32, i32, i32), scale: f32) {
+        self.popup = kind;
+        self.mixer_scale = scale;
+        self.mixer_anchor = anchor;
         match kind {
             Popup::Mixer => self.mixer_rows = Self::load_mixer_rows(),
             Popup::Outputs => {
@@ -910,9 +1019,12 @@ impl App {
                     return;
                 }
             }
+            Popup::Menu => self.menu_rows = self.build_menu(),
         }
         self.outputs_hover = None;
         self.outputs_frame = None;
+        self.menu_hover = None;
+        self.menu_frame = None;
         self.mixer_hover = None;
         self.mixer_drag = None;
         self.mixer_frame = None;
@@ -936,6 +1048,7 @@ impl App {
         self.mixer_drag = None;
         self.mixer_frame = None;
         self.outputs_frame = None;
+        self.menu_frame = None;
         unsafe {
             let _ = ShowWindow(self.mixer, SW_HIDE);
         }
@@ -949,18 +1062,23 @@ impl App {
 
     /// Draw the mixer if anything changed, and keep it placed above (or,
     /// for a taskbar at the top, below) the volume button.
-    fn show_mixer(&mut self) {
-        let accent = match self.cfg.accent_mode {
+    /// The highlight color the popups use (0 means the text color).
+    fn popup_accent(&self) -> u32 {
+        match self.cfg.accent_mode {
             2 => 0,
             3 => self.cfg.accent_rgb,
             _ => self.system_accent,
-        };
-        let frame = render::Mixer {
+        }
+    }
+
+    /// The mixer as it should be drawn now.
+    fn mixer_picture(&self) -> render::Mixer {
+        render::Mixer {
             scale: self.mixer_scale,
             smooth: self.cfg.smooth,
             light: self.system_light,
             font: self.cfg.font,
-            accent,
+            accent: self.popup_accent(),
             rows: self
                 .mixer_rows
                 .iter()
@@ -973,14 +1091,17 @@ impl App {
             hover_row: self.mixer_hover.map_or(-1, |(row, _)| row as i32),
             hover_icon: self.mixer_hover.is_some_and(|(_, part)| part == MixerPart::Icon),
             drag_row: self.mixer_drag.map_or(-1, |row| row as i32),
-        };
-        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
-        let picker = render::Picker {
+        }
+    }
+
+    /// The output device list as it should be drawn now.
+    fn outputs_picture(&self) -> render::Picker {
+        render::Picker {
             scale: self.mixer_scale,
             smooth: self.cfg.smooth,
             light: self.system_light,
             font: self.cfg.font,
-            accent,
+            accent: self.popup_accent(),
             rows: self
                 .outputs_rows
                 .iter()
@@ -991,11 +1112,135 @@ impl App {
                 })
                 .collect(),
             hover_row: self.outputs_hover.map_or(-1, |row| row as i32),
+        }
+    }
+
+    /// The right-click menu as it should be drawn now.
+    fn menu_picture(&self) -> render::MenuPanel {
+        render::MenuPanel {
+            scale: self.mixer_scale,
+            smooth: self.cfg.smooth,
+            light: self.system_light,
+            font: self.cfg.font,
+            accent: self.popup_accent(),
+            rows: self
+                .menu_rows
+                .iter()
+                .map(|r| render::MenuItem { text: r.text.clone(), kind: r.kind, tick: r.tick, strong: r.strong })
+                .collect(),
+            hover_row: self.menu_hover.map_or(-1, |row| row as i32),
+        }
+    }
+
+    /// The hover card for the current track.
+    fn card_picture(&self, scale: f32) -> Card {
+        let (w, h) = render::card_size(scale);
+        let sample = !self.snap.active;
+        let status = {
+            let app = if sample { "Player".to_string() } else { launch::display_name(&self.snap.app_id) };
+            let state = if sample || self.snap.playing { "Playing" } else { "Paused" };
+            if self.has_timeline() {
+                format!("{app}  \u{00B7}  {state}  \u{00B7}  {}", format_time(self.snap.end - self.snap.start))
+            } else {
+                format!("{app}  \u{00B7}  {state}")
+            }
         };
+        let or_sample = |text: &str, stand_in: &str| if sample { stand_in.to_string() } else { text.to_string() };
+        Card {
+            w,
+            h,
+            scale,
+            smooth: self.cfg.smooth,
+            light: self.system_light,
+            font: self.cfg.font,
+            title: or_sample(&self.snap.title, "Song title"),
+            artist: or_sample(&self.snap.artist, "Artist"),
+            album: or_sample(&self.snap.album, "Album"),
+            status,
+            art_gen: self.snap.art_gen,
+            has_art: self.snap.art.is_some(),
+        }
+    }
+
+    /// Save pictures of the widget and each of its popups, drawn by the
+    /// same code that draws them on screen, as PNG files in `dir`. They are
+    /// drawn at twice the size of the main display's scale so that they stay
+    /// sharp on a web page. Returns how many files were written.
+    fn save_pictures(&mut self, dir: &std::path::Path) -> usize {
+        if std::fs::create_dir_all(dir).is_err() {
+            return 0;
+        }
+        let base = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96) as f32 / 96.0;
+        let scale = base * 2.0;
+        let pad = (20.0 * scale) as i32;
+        let backdrop = if self.system_light { 0x00C9_D8F0 } else { 0x0023_2A44 };
+        let art = self.snap.art.clone();
+        let art = art.as_deref().map(|v| v.as_slice());
+        let spotify = self.snap.app_id.to_lowercase().contains("spotify");
+        let mut saved = 0;
+
+        // The widget, on a strip the color of the taskbar.
+        let mut params = self.layout_params((40.0 * scale) as i32, scale, true);
+        if !self.snap.active {
+            params.extra = true;
+            params.players = true;
+            params.time_chars = 4;
+        }
+        let layout = Layout::new(&params);
+        let w = layout.width.ceil() as i32;
+        let frame = self.make_frame(params, &layout, w, params.height, None);
+        let taskbar = if frame.light { 0x00E9_EDF3 } else { 0x0018_191D };
+        let pixels = render::render_preview(&frame, art, spotify, taskbar);
+        saved += usize::from(render::save_png(&dir.join("widget.png"), &pixels, w, params.height, true, taskbar, 0));
+
+        // The popups, each on a plain backdrop. Their contents are loaded
+        // fresh and the popup's own state is put back afterwards.
+        let keep = (self.mixer_scale, self.mixer_hover, self.outputs_hover, self.menu_hover);
+        let rows = (
+            std::mem::take(&mut self.mixer_rows),
+            std::mem::take(&mut self.outputs_rows),
+            std::mem::take(&mut self.menu_rows),
+            std::mem::take(&mut self.outputs_current),
+        );
+        self.mixer_scale = scale;
+        (self.mixer_hover, self.outputs_hover, self.menu_hover) = (None, None, None);
+        self.mixer_rows = Self::load_mixer_rows();
+        self.load_outputs();
+        self.menu_rows = self.build_menu();
+
+        let card = self.card_picture(scale);
+        let (mixer, outputs, menu) = (self.mixer_picture(), self.outputs_picture(), self.menu_picture());
+        let shots = [
+            ("card.png", render::Shot::Card(&card, art, spotify)),
+            ("mixer.png", render::Shot::Mixer(&mixer)),
+            ("outputs.png", render::Shot::Picker(&outputs)),
+            ("menu.png", render::Shot::Menu(&menu)),
+        ];
+        for (name, shot) in shots {
+            if let Some((pixels, w, h)) = render::snapshot(shot) {
+                saved += usize::from(render::save_png(&dir.join(name), &pixels, w, h, false, backdrop, pad));
+            }
+        }
+
+        (self.mixer_scale, self.mixer_hover, self.outputs_hover, self.menu_hover) = keep;
+        (self.mixer_rows, self.outputs_rows, self.menu_rows, self.outputs_current) = rows;
+        saved
+    }
+
+    fn show_mixer(&mut self) {
+        let frame = self.mixer_picture();
+        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
+        let picker = self.outputs_picture();
+        let menu = self.menu_picture();
         let (w, h) = match self.popup {
             Popup::Mixer => (layout.w, layout.h),
             Popup::Outputs => {
                 let (w, h, _) = render::picker_layout(self.mixer_scale, self.outputs_rows.len());
+                (w, h)
+            }
+            Popup::Menu => {
+                let kinds: Vec<u8> = self.menu_rows.iter().map(|r| r.kind).collect();
+                let (w, h, _) = render::menu_layout(self.mixer_scale, &kinds);
                 (w, h)
             }
         };
@@ -1020,6 +1265,10 @@ impl App {
                 Popup::Outputs if self.outputs_frame.as_ref() != Some(&picker) => {
                     render::paint_picker(self.mixer, &picker);
                     self.outputs_frame = Some(picker);
+                }
+                Popup::Menu if self.menu_frame.as_ref() != Some(&menu) => {
+                    render::paint_menu(self.mixer, &menu);
+                    self.menu_frame = Some(menu);
                 }
                 _ => {}
             }
@@ -1145,7 +1394,64 @@ impl App {
         self.notice = Some((message, Instant::now()));
     }
 
+    /// The command row of the menu at a point in the popup.
+    fn menu_hit(&self, x: i32, y: i32) -> Option<usize> {
+        let kinds: Vec<u8> = self.menu_rows.iter().map(|r| r.kind).collect();
+        let (_, _, rows) = render::menu_layout(self.mixer_scale, &kinds);
+        rows.iter()
+            .position(|r| r.contains(x as f32, y as f32))
+            .filter(|row| self.menu_rows[*row].kind == 0)
+    }
+
+    /// Carry out a row of the right-click menu.
+    fn run_menu(&mut self, row: usize) -> Action {
+        let Some(cmd) = self.menu_rows.get(row).map(|r| r.cmd.clone()) else { return Action::None };
+        let (anchor, scale) = (self.mixer_anchor, self.mixer_scale);
+        self.close_mixer();
+        match cmd {
+            MenuCmd::None => Action::None,
+            MenuCmd::Update => Action::Releases,
+            MenuCmd::Open => Action::Open(self.snap.app_id.clone()),
+            MenuCmd::Settings => Action::Settings,
+            MenuCmd::Exit => Action::Exit,
+            MenuCmd::Copy => {
+                let text = if self.snap.artist.is_empty() {
+                    self.snap.title.clone()
+                } else {
+                    format!("{} - {}", self.snap.artist, self.snap.title)
+                };
+                let done = copy_to_clipboard(self.controller, &text);
+                let message = if done { "Copied to clipboard" } else { "Could not copy" };
+                self.notice = Some((message.to_string(), Instant::now()));
+                self.tick();
+                Action::None
+            }
+            MenuCmd::Auto | MenuCmd::Player(_) => {
+                media::set_preferred(match cmd {
+                    MenuCmd::Player(id) => Some(id),
+                    _ => None,
+                });
+                let _ = self.tx.send(Cmd::Refresh);
+                Action::None
+            }
+            // These two take the menu's place.
+            MenuCmd::Mixer => {
+                self.open_popup(Popup::Mixer, anchor, scale);
+                Action::None
+            }
+            MenuCmd::Outputs => {
+                self.open_popup(Popup::Outputs, anchor, scale);
+                Action::None
+            }
+        }
+    }
+
     fn mixer_mouse_move(&mut self, x: i32, y: i32) {
+        if self.popup == Popup::Menu {
+            self.menu_hover = self.menu_hit(x, y);
+            self.show_mixer();
+            return;
+        }
         if self.popup == Popup::Outputs {
             self.outputs_hover = self.outputs_hit(x, y);
             self.show_mixer();
@@ -1161,7 +1467,13 @@ impl App {
         self.show_mixer();
     }
 
-    fn mixer_mouse_down(&mut self, x: i32, y: i32) {
+    fn mixer_mouse_down(&mut self, x: i32, y: i32) -> Action {
+        if self.popup == Popup::Menu {
+            return match self.menu_hit(x, y) {
+                Some(row) => self.run_menu(row),
+                None => Action::None,
+            };
+        }
         if self.popup == Popup::Outputs {
             // Choosing a device switches to it and closes the list.
             if let Some(device) = self.outputs_hit(x, y).and_then(|row| self.outputs_rows.get(row).cloned()) {
@@ -1169,7 +1481,7 @@ impl App {
                 self.close_mixer();
                 self.tick();
             }
-            return;
+            return Action::None;
         }
         match self.mixer_hit(x, y) {
             Some((row, MixerPart::Slider)) => {
@@ -1194,6 +1506,7 @@ impl App {
             None => {}
         }
         self.show_mixer();
+        Action::None
     }
 
     fn mixer_mouse_up(&mut self) {
@@ -1241,8 +1554,7 @@ impl App {
         });
         let allowed = self.cfg.hover_card
             && self.snap.active
-            && !self.mixer_open
-            && !MENU_OPEN.load(Ordering::Relaxed);
+            && !self.mixer_open;
         if over.is_none() {
             self.card_dismissed = false;
         }
@@ -1262,30 +1574,8 @@ impl App {
         }
 
         let scale = self.widgets[i].params.scale.max(0.5);
-        let (w, h) = render::card_size(scale);
-        let status = {
-            let app = launch::display_name(&self.snap.app_id);
-            let state = if self.snap.playing { "Playing" } else { "Paused" };
-            if self.has_timeline() {
-                format!("{app}  \u{00B7}  {state}  \u{00B7}  {}", format_time(self.snap.end - self.snap.start))
-            } else {
-                format!("{app}  \u{00B7}  {state}")
-            }
-        };
-        let frame = Card {
-            w,
-            h,
-            scale,
-            smooth: self.cfg.smooth,
-            light: self.system_light,
-            font: self.cfg.font,
-            title: self.snap.title.clone(),
-            artist: self.snap.artist.clone(),
-            album: self.snap.album.clone(),
-            status,
-            art_gen: self.snap.art_gen,
-            has_art: self.snap.art.is_some(),
-        };
+        let frame = self.card_picture(scale);
+        let (w, h) = (frame.w, frame.h);
 
         // Centred above the widget (below it for a taskbar at the top),
         // kept on the widget's monitor.
@@ -1330,30 +1620,164 @@ impl App {
         }
     }
 
+    /// Everything a widget of this layout and size shows right now, with no
+    /// mouse interaction. `position` overrides the played fraction (while
+    /// the seek bar is being dragged). With nothing playing, a sample track
+    /// stands in, so that the settings preview always has something to show.
+    fn make_frame(&self, params: LayoutParams, layout: &Layout, w: i32, h: i32, position: Option<f32>) -> Frame {
+        let sample = !self.snap.active;
+        let (title, artist, album) = if sample {
+            ("Song title".to_string(), "Artist".to_string(), "Album".to_string())
+        } else {
+            (self.snap.title.clone(), self.snap.artist.clone(), self.snap.album.clone())
+        };
+        let has_timeline = if sample { self.cfg.text_layout < 3 } else { self.seek_shown() };
+        let duration = if sample { 222 * 10_000_000 } else { (self.snap.end - self.snap.start).max(1) };
+        let fraction = position
+            .unwrap_or_else(|| {
+                if sample {
+                    0.38
+                } else {
+                    ((self.current_position() - self.snap.start) as f64 / duration as f64) as f32
+                }
+            })
+            .clamp(0.0, 1.0);
+        let shown_pos = (fraction as f64 * duration as f64) as i64;
+        // Whole pixels, so the bar only repaints when it visibly moves.
+        let track_w = layout.track.w.max(1.0);
+        let fill = (fraction * track_w).round() / track_w;
+
+        // Which text goes where, per the chosen text layout.
+        let (line1, inline, below) = match self.cfg.text_layout {
+            1 => (title, String::new(), artist),
+            2 if !artist.is_empty() => (artist, title, String::new()),
+            2 => (title, String::new(), String::new()),
+            3 => (title, String::new(), artist),
+            4 if !album.is_empty() => (title, String::new(), album),
+            4 => (title, String::new(), artist),
+            // "Title · Artist" needs the seek bar row; without one the
+            // artist drops to the second row.
+            _ if has_timeline => (title, artist, String::new()),
+            _ => (title, String::new(), artist),
+        };
+        let (fg, light) = self.text_color();
+
+        Frame {
+            w,
+            h,
+            params,
+            smooth: self.cfg.smooth,
+            light,
+            fg,
+            title: line1,
+            artist: inline,
+            below,
+            art_gen: self.snap.art_gen,
+            has_art: self.snap.art.is_some(),
+            playing: sample || self.snap.playing,
+            can_prev: sample || self.snap.can_prev,
+            can_next: sample || self.snap.can_next,
+            can_toggle: sample || self.snap.can_toggle,
+            can_seek: sample || self.snap.can_seek,
+            has_timeline,
+            elapsed: if has_timeline { format_time(shown_pos) } else { String::new() },
+            total: if has_timeline { format_time(duration) } else { String::new() },
+            fill,
+            hover: Hit::None,
+            pressed: Hit::None,
+            dragging: false,
+            scroll: false,
+            scroll_px: 0,
+            can_shuffle: sample || self.snap.can_shuffle,
+            shuffle: self.snap.shuffle,
+            can_repeat: sample || self.snap.can_repeat,
+            repeat: self.snap.repeat,
+            // Windows' accent and a custom color are both a fixed color.
+            accent: if self.cfg.accent_mode == 3 { 1 } else { self.cfg.accent_mode },
+            accent_rgb: if self.cfg.accent_mode == 3 { self.cfg.accent_rgb } else { self.system_accent },
+            art_shape: self.cfg.art_shape,
+            background: self.cfg.background,
+            font: self.cfg.font,
+            volume: self.volume_flash.as_ref().map(|(level, _)| *level),
+            notice: self.notice.as_ref().map(|(text, _)| text.clone()),
+            update: update::available().is_some(),
+            headphones: self.output.as_ref().is_some_and(|d| d.headphones),
+            vol: self.volume.map_or(if sample { 70 } else { 0 }, |(level, _)| (level * 100.0).round() as u8),
+            vol_muted: self.volume.is_some_and(|(_, muted)| muted),
+            mixer_open: self.mixer_open && self.popup == Popup::Mixer,
+            outputs_open: self.mixer_open && self.popup == Popup::Outputs,
+            players_enabled: sample || self.snap.sessions.len() > 1,
+        }
+    }
+
+    /// The layout settings as they apply to one taskbar.
+    fn layout_params(&self, height: i32, scale: f32, main_taskbar: bool) -> LayoutParams {
+        LayoutParams {
+            height,
+            scale,
+            time_chars: format_time(self.snap.end - self.snap.start).len(),
+            text_size: self.cfg.text_size,
+            width: self.cfg.width,
+            show_times: self.cfg.show_times,
+            mini: false,
+            // Buttons that cannot be used right now are shown greyed out,
+            // unless the user prefers them left out.
+            extra: !self.cfg.hide_unusable || self.snap.can_shuffle || self.snap.can_repeat,
+            players: !self.cfg.hide_unusable || self.snap.sessions.len() > 1,
+            gap: self.cfg.button_gap,
+            stack: self.cfg.stack_extras,
+            order: self.cfg.order(main_taskbar),
+            button_size: self.cfg.button_size,
+            seek_size: self.cfg.seek_size,
+        }
+    }
+
+    /// A picture of the widget for the settings window: opaque pixels, its
+    /// width and height, and the taskbar-like color behind it. Scaled down
+    /// if it would be wider than `max_w`.
+    fn preview(&self, max_w: i32, other_taskbars: bool) -> Option<(Vec<u32>, i32, i32, u32)> {
+        // Size it like the real thing on the main taskbar, when there is one.
+        let real = self.widgets.iter().find(|w| w.primary && w.params.height > 0);
+        let (mut height, mut scale) = match real {
+            Some(w) => (w.params.height, w.params.scale),
+            None => {
+                let scale = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96) as f32 / 96.0;
+                ((40.0 * scale) as i32, scale)
+            }
+        };
+        // With nothing playing every button is shown, as a sample.
+        let build = |height: i32, scale: f32| {
+            let mut params = self.layout_params(height, scale, !other_taskbars);
+            if !self.snap.active {
+                params.extra = true;
+                params.players = true;
+                params.time_chars = 4;
+            }
+            let layout = Layout::new(&params);
+            (params, layout)
+        };
+        let (mut params, mut layout) = build(height, scale);
+        if layout.width > max_w as f32 && layout.width > 1.0 {
+            let shrink = max_w as f32 / layout.width;
+            height = ((height as f32 * shrink) as i32).max(16);
+            scale *= shrink;
+            (params, layout) = build(height, scale);
+        }
+        let w = (layout.width.ceil() as i32).min(max_w).max(1);
+        let frame = self.make_frame(params, &layout, w, height, None);
+        let background = if frame.light { 0x00E9_EDF3 } else { 0x0018_191D };
+        let art = self.snap.art.clone();
+        let spotify = self.snap.app_id.to_lowercase().contains("spotify");
+        let pixels = render::render_preview(&frame, art.as_deref().map(|v| v.as_slice()), spotify, background);
+        (!pixels.is_empty()).then_some((pixels, w, height, background))
+    }
+
     /// Redraw widget `i` if anything visible changed since its last frame.
     fn repaint(&mut self, i: usize) {
         let (_, _, w, h) = self.widgets[i].rect;
         if w <= 0 || h <= 0 || !self.snap.active {
             return;
         }
-        let has_timeline = self.seek_shown();
-        let duration = (self.snap.end - self.snap.start).max(1);
-
-        // Which text goes where, per the chosen text layout.
-        let (title, artist, album) = (&self.snap.title, &self.snap.artist, &self.snap.album);
-        let (line1, inline, below) = match self.cfg.text_layout {
-            1 => (title.clone(), String::new(), artist.clone()),
-            2 if !artist.is_empty() => (artist.clone(), title.clone(), String::new()),
-            2 => (title.clone(), String::new(), String::new()),
-            3 => (title.clone(), String::new(), artist.clone()),
-            4 if !album.is_empty() => (title.clone(), String::new(), album.clone()),
-            4 => (title.clone(), String::new(), artist.clone()),
-            // "Title · Artist" needs the seek bar row; without one the
-            // artist drops to the second row.
-            _ if has_timeline => (title.clone(), artist.clone(), String::new()),
-            _ => (title.clone(), String::new(), artist.clone()),
-        };
-
         // Title scrolling: restart the cycle whenever the text changes.
         let scroll = self.cfg.scroll_titles && !self.widgets[i].params.mini;
         let key = format!("{}\u{1}{}", self.snap.title, self.snap.artist);
@@ -1371,63 +1795,13 @@ impl App {
         };
 
         let widget = &self.widgets[i];
-        let fraction = if widget.dragging {
-            widget.drag_fraction
-        } else {
-            ((self.current_position() - self.snap.start) as f64 / duration as f64) as f32
-        }
-        .clamp(0.0, 1.0);
-        let shown_pos = (fraction as f64 * duration as f64) as i64;
-        // Whole pixels, so the bar only repaints when it visibly moves.
-        let track_w = widget.layout.track.w.max(1.0);
-        let fill = (fraction * track_w).round() / track_w;
-
-        let frame = Frame {
-            w,
-            h,
-            params: widget.params,
-            smooth: self.cfg.smooth,
-            light: self.text_color().1,
-            fg: self.text_color().0,
-            title: line1,
-            artist: inline,
-            below,
-            art_gen: self.snap.art_gen,
-            has_art: self.snap.art.is_some(),
-            playing: self.snap.playing,
-            can_prev: self.snap.can_prev,
-            can_next: self.snap.can_next,
-            can_toggle: self.snap.can_toggle,
-            can_seek: self.snap.can_seek,
-            has_timeline,
-            elapsed: if has_timeline { format_time(shown_pos) } else { String::new() },
-            total: if has_timeline { format_time(duration) } else { String::new() },
-            fill,
-            hover: widget.hover,
-            pressed: widget.pressed,
-            dragging: widget.dragging,
-            scroll,
-            scroll_px,
-            can_shuffle: self.snap.can_shuffle,
-            shuffle: self.snap.shuffle,
-            can_repeat: self.snap.can_repeat,
-            repeat: self.snap.repeat,
-            // Windows' accent and a custom color are both a fixed color.
-            accent: if self.cfg.accent_mode == 3 { 1 } else { self.cfg.accent_mode },
-            accent_rgb: if self.cfg.accent_mode == 3 { self.cfg.accent_rgb } else { self.system_accent },
-            art_shape: self.cfg.art_shape,
-            background: self.cfg.background,
-            font: self.cfg.font,
-            volume: self.volume_flash.as_ref().map(|(level, _)| *level),
-            notice: self.notice.as_ref().map(|(text, _)| text.clone()),
-            update: update::available().is_some(),
-            headphones: self.output.as_ref().is_some_and(|d| d.headphones),
-            vol: self.volume.map_or(0, |(level, _)| (level * 100.0).round() as u8),
-            vol_muted: self.volume.is_some_and(|(_, muted)| muted),
-            mixer_open: self.mixer_open && self.popup == Popup::Mixer,
-            outputs_open: self.mixer_open && self.popup == Popup::Outputs,
-            players_enabled: self.snap.sessions.len() > 1,
-        };
+        let dragged = widget.dragging.then_some(widget.drag_fraction);
+        let mut frame = self.make_frame(widget.params, &widget.layout, w, h, dragged);
+        frame.hover = widget.hover;
+        frame.pressed = widget.pressed;
+        frame.dragging = widget.dragging;
+        frame.scroll = scroll;
+        frame.scroll_px = scroll_px;
         if widget.last_frame.as_ref() != Some(&frame) {
             let art = self.snap.art.clone();
             let spotify = self.snap.app_id.to_lowercase().contains("spotify");
@@ -1623,113 +1997,6 @@ impl App {
     }
 }
 
-fn show_menu(hwnd: HWND) {
-    const ID_OPEN: usize = 1;
-    const ID_SETTINGS: usize = 2;
-    const ID_EXIT: usize = 3;
-    const ID_UPDATE: usize = 4;
-    const ID_AUTO: usize = 99;
-    const ID_PLAYER: usize = 100;
-    const ID_OUTPUT: usize = 200;
-
-    let Some((app_id, sessions, module, tx)) =
-        with_app(|a| (a.snap.app_id.clone(), a.snap.sessions.clone(), a.module, a.tx.clone()))
-    else {
-        return;
-    };
-    let preferred = media::preferred();
-    let newer = update::available();
-    let outputs = devices::list();
-    let current_output = devices::current().map(|d| d.id);
-
-    // The menu runs its own message loop, so the app state must not be
-    // borrowed while it is open.
-    let choice = unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        if let Some(version) = &newer {
-            let text = HSTRING::from(format!("Get version {version}..."));
-            let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, &text);
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        }
-        let _ = AppendMenuW(menu, MF_STRING, ID_OPEN, w!("Open player"));
-        // With more than one player around, let the user pick.
-        if sessions.len() > 1 {
-            if let Ok(players) = CreatePopupMenu() {
-                let auto = if preferred.is_none() { MF_CHECKED } else { MF_UNCHECKED };
-                let _ = AppendMenuW(players, MF_STRING | auto, ID_AUTO, w!("Automatic"));
-                let _ = AppendMenuW(players, MF_SEPARATOR, 0, None);
-                for (i, id) in sessions.iter().enumerate().take(50) {
-                    let check = if preferred.as_ref() == Some(id) { MF_CHECKED } else { MF_UNCHECKED };
-                    let name = HSTRING::from(launch::display_name(id));
-                    let _ = AppendMenuW(players, MF_STRING | check, ID_PLAYER + i, &name);
-                }
-                let _ = AppendMenuW(menu, MF_POPUP, players.0 as usize, w!("Player"));
-            }
-        }
-        if outputs.len() > 1 {
-            if let Ok(submenu) = CreatePopupMenu() {
-                append_outputs(submenu, &outputs, current_output.as_deref(), ID_OUTPUT);
-                let _ = AppendMenuW(menu, MF_POPUP, submenu.0 as usize, w!("Output device"));
-            }
-        }
-        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings..."));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
-        track_menu(menu, hwnd)
-    };
-
-    match choice {
-        n if n >= ID_OUTPUT && n < ID_OUTPUT + outputs.len() => switch_output(&outputs[n - ID_OUTPUT]),
-        ID_OPEN => launch::open_app(&app_id),
-        ID_SETTINGS => settings::open(module),
-        ID_UPDATE => open_releases_page(),
-        ID_EXIT => unsafe { PostQuitMessage(0) },
-        ID_AUTO => {
-            media::set_preferred(None);
-            let _ = tx.send(Cmd::Refresh);
-        }
-        n if n >= ID_PLAYER && n < ID_PLAYER + sessions.len() => {
-            media::set_preferred(Some(sessions[n - ID_PLAYER].clone()));
-            let _ = tx.send(Cmd::Refresh);
-        }
-        _ => {}
-    }
-}
-
-/// Show a popup menu at the mouse and return the chosen item's id (0 if
-/// none). Destroys the menu. Must not be called with the app state borrowed:
-/// the menu runs its own message loop.
-unsafe fn track_menu(menu: HMENU, hwnd: HWND) -> usize {
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
-    // Required so the menu closes when the user clicks elsewhere.
-    let _ = SetForegroundWindow(hwnd);
-    MENU_OPEN.store(true, Ordering::Relaxed);
-    let choice = TrackPopupMenu(
-        menu,
-        TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-        pt.x,
-        pt.y,
-        None,
-        hwnd,
-        None,
-    );
-    MENU_OPEN.store(false, Ordering::Relaxed);
-    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-    let _ = DestroyMenu(menu);
-    choice.0 as usize
-}
-
-/// Add one entry per output device, ticking the current one.
-unsafe fn append_outputs(menu: HMENU, outputs: &[devices::Device], current: Option<&str>, first_id: usize) {
-    for (i, device) in outputs.iter().enumerate().take(50) {
-        let check = if current == Some(device.id.as_str()) { MF_CHECKED } else { MF_UNCHECKED };
-        // "&" would otherwise underline the next letter.
-        let name = HSTRING::from(device.name.replace('&', "&&"));
-        let _ = AppendMenuW(menu, MF_STRING | check, first_id + i, &name);
-    }
-}
-
 /// Flip between the two output devices chosen in settings.
 fn toggle_output() {
     let Some((a, b)) = with_app(|app| (app.cfg.output_a.clone(), app.cfg.output_b.clone())) else {
@@ -1822,12 +2089,8 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             let (x, y) = point(lparam);
             // Launching or opening a window pumps messages, so do it after
             // the app state has been released.
-            let action = with_widget(hwnd, |a, i| (a.mouse_up(i, x, y), a.module));
-            match action {
-                Some((Action::Open(app_id), _)) => launch::open_app(&app_id),
-                Some((Action::Settings, module)) => settings::open(module),
-                Some((Action::ToggleOutput, _)) => toggle_output(),
-                _ => {}
+            if let Some((action, module)) = with_widget(hwnd, |a, i| (a.mouse_up(i, x, y), a.module)) {
+                perform(action, module);
             }
             LRESULT(0)
         }
@@ -1846,7 +2109,7 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     }
                 });
             } else {
-                show_menu(hwnd);
+                with_widget(hwnd, |a, i| a.open_menu(Some(i)));
             }
             LRESULT(0)
         }
@@ -1900,6 +2163,7 @@ unsafe extern "system" fn mixer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 if a.mixer_open && a.mixer_drag.is_none() {
                     a.mixer_hover = None;
                     a.outputs_hover = None;
+                    a.menu_hover = None;
                     a.show_mixer();
                 }
             });
@@ -1907,7 +2171,11 @@ unsafe extern "system" fn mixer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         }
         WM_LBUTTONDOWN => {
             let (x, y) = point(lparam);
-            with_app(|a| a.mixer_mouse_down(x, y));
+            // Opening settings and the like pumps messages, so do it after
+            // the app state has been released.
+            if let Some((action, module)) = with_app(|a| (a.mixer_mouse_down(x, y), a.module)) {
+                perform(action, module);
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -1960,6 +2228,16 @@ unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wparam: WPARAM, 
             }
             LRESULT(0)
         }
+        // Windows is shutting down or the user is signing out: leave
+        // cleanly, so that it is not mistaken for a crash.
+        WM_ENDSESSION if wparam.0 != 0 => {
+            with_app(|a| {
+                if a.tray_shown {
+                    tray::remove(a.controller);
+                }
+            });
+            std::process::exit(0);
+        }
         WM_APP_UPDATE => {
             with_app(|a| {
                 a.pull_snapshot();
@@ -1975,7 +2253,9 @@ unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                         settings::open(module);
                     }
                 }
-                WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
+                WM_RBUTTONUP | WM_CONTEXTMENU => {
+                    with_app(|a| a.open_menu(None));
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -1989,10 +2269,64 @@ unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wparam: WPARAM, 
     }
 }
 
-fn main() {
+/// The process the user starts. It shows nothing itself: it runs the widget
+/// as a second copy of this exe and starts it again if it crashes.
+fn supervise() {
     unsafe {
         // One instance only.
         let _mutex = CreateMutexW(None, true, w!("Local\\TaskbarMediaWidget"));
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let mut crashes: Vec<Instant> = Vec::new();
+        loop {
+            match std::process::Command::new(&exe).arg(WORKER_FLAG).status() {
+                // Exit code 0: the user chose Exit.
+                Ok(status) if status.success() => return,
+                // Ended from Task Manager (1), or by Windows shutting down:
+                // deliberate, so not something to undo.
+                Ok(status) if matches!(status.code().map(|c| c as u32), Some(1 | 0x4001_0004 | 0xC000_013A)) => {
+                    return;
+                }
+                Ok(status) => {
+                    let code = status.code().map_or("unknown".to_string(), |c| format!("{:#010x}", c as u32));
+                    crash::write(&format!("the widget stopped unexpectedly (exit code {code})"));
+                }
+                Err(error) => {
+                    crash::write(&format!("could not start the widget: {error}"));
+                    return;
+                }
+            }
+            // Something that crashes over and over is better left stopped.
+            crashes.retain(|at| at.elapsed() < Duration::from_secs(300));
+            crashes.push(Instant::now());
+            if crashes.len() >= 5 {
+                crash::write("crashed 5 times in 5 minutes; not restarting again");
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+            crash::write("restarting the widget");
+        }
+    }
+}
+
+const WORKER_FLAG: &str = "--widget";
+
+fn main() {
+    crash::install();
+    if std::env::args().any(|arg| arg == WORKER_FLAG) {
+        run_widget();
+    } else {
+        supervise();
+    }
+}
+
+/// The widget itself.
+fn run_widget() {
+    unsafe {
+        // One widget process only.
+        let _mutex = CreateMutexW(None, true, w!("Local\\TaskbarMediaWidgetProcess"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }
@@ -2142,6 +2476,9 @@ fn main() {
                 outputs_current: String::new(),
                 outputs_hover: None,
                 outputs_frame: None,
+                menu_rows: Vec::new(),
+                menu_hover: None,
+                menu_frame: None,
                 mixer_rows: Vec::new(),
                 mixer_hover: None,
                 mixer_drag: None,

@@ -13,9 +13,12 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, EnumDisplayMonitors, GetMonitorInfoW, GetSysColorBrush, MonitorFromPoint,
-    COLOR_3DFACE, HDC, HFONT, HMONITOR, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    BeginPaint, CreateFontW, EndPaint, EnumDisplayMonitors, GetMonitorInfoW, GetSysColorBrush,
+    InvalidateRect, MonitorFromPoint, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER,
+    COLOR_3DFACE, DIB_RGB_COLORS, HDC, HFONT, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, NMHDR,
     TCIF_TEXT, TCITEMW,
@@ -56,6 +59,14 @@ const ID_OUTPUT_B: i32 = 138;
 const ID_LAYOUT_TARGET: i32 = 139;
 const ID_VOLUME_TARGET: i32 = 145;
 const ID_BUTTON_GAP: i32 = 146;
+const ID_PRESET: i32 = 147;
+const ID_LOG: i32 = 129;
+const ID_PICTURES: i32 = 161;
+/// Posted to the window to rebuild it on a given tab once the current
+/// message has been dealt with.
+const WM_APP_REOPEN: u32 = WM_APP + 10;
+const ID_PREVIEW: i32 = 151;
+const PREVIEW_TIMER: usize = 7;
 const ID_STACK: i32 = 109;
 const ID_HIDE_UNUSABLE: i32 = 160;
 const ID_LAYOUT2: i32 = 107;
@@ -88,6 +99,9 @@ const LB_ADDSTRING: u32 = 0x0180;
 const LB_RESETCONTENT: u32 = 0x0184;
 const LB_SETCURSEL: u32 = 0x0186;
 const LB_GETCURSEL: u32 = 0x0188;
+const LB_GETTOPINDEX: u32 = 0x018E;
+const LB_SETTOPINDEX: u32 = 0x0197;
+const LB_ITEMFROMPOINT: u32 = 0x01A9;
 const TCM_GETCURSEL: u32 = 0x130B;
 const TCM_INSERTITEMW: u32 = 0x133E;
 const TCM_SETCURSEL: u32 = 0x130C;
@@ -104,7 +118,9 @@ const LBN_SELCHANGE: u32 = 1;
 // Window layout at 96 dpi: a tab strip, the tab's controls, a row of buttons.
 const CLIENT_W: i32 = 400;
 const TOP: i32 = 48;
-const BUTTONS_Y: i32 = 526;
+const BUTTONS_Y: i32 = 496;
+/// Height taken by the live preview strip above the tabs, when shown.
+const PREVIEW_H: i32 = 62;
 const CLIENT_H: i32 = BUTTONS_Y + 28 + 14;
 const TAB_NAMES: [&str; 5] = ["General", "Layout", "Appearance", "Behavior", "More"];
 
@@ -120,6 +136,8 @@ thread_local! {
     /// "not set").
     static OUTPUTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     /// Which layout the Layout tab is editing: 0 main taskbar, 1 the others.
+    /// The row of the layout list being dragged to a new position.
+    static DRAG_ROW: Cell<Option<usize>> = const { Cell::new(None) };
     /// The tab to show when the window next opens.
     static START_TAB: Cell<usize> = const { Cell::new(0) };
     static LAYOUT_TARGET: Cell<usize> = const { Cell::new(0) };
@@ -158,6 +176,13 @@ pub fn register_class(module: HINSTANCE) {
             ..Default::default()
         };
         RegisterClassW(&class);
+        let preview = WNDCLASSW {
+            lpfnWndProc: Some(preview_proc),
+            hInstance: module,
+            lpszClassName: w!("TaskbarMediaPreview"),
+            ..Default::default()
+        };
+        RegisterClassW(&preview);
     }
 }
 
@@ -203,6 +228,8 @@ struct Builder {
     d: f32,
     /// The tab the controls being created belong to.
     tab: Cell<usize>,
+    /// Added to every y (96-dpi units): the room taken by the preview.
+    oy: Cell<i32>,
 }
 
 impl Builder {
@@ -232,7 +259,7 @@ impl Builder {
             &HSTRING::from(text),
             WS_CHILD | visible | WINDOW_STYLE(style),
             self.px(x),
-            self.px(y),
+            self.px(y + self.oy.get()),
             self.px(w),
             self.px(h),
             Some(self.parent),
@@ -316,18 +343,22 @@ pub fn open(module: HINSTANCE) {
 
         let cfg = crate::current_config();
         let d = GetDpiForSystem().max(96) as f32 / 96.0;
-        let (client_w, client_h) = ((CLIENT_W as f32 * d) as i32, (CLIENT_H as f32 * d) as i32);
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut wr = RECT { left: 0, top: 0, right: client_w, bottom: client_h };
-        let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
-        let (win_w, win_h) = (wr.right - wr.left, wr.bottom - wr.top);
+        let window_size = |client_h: i32| {
+            let mut wr = RECT { left: 0, top: 0, right: (CLIENT_W as f32 * d) as i32, bottom: (client_h as f32 * d) as i32 };
+            let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
+            (wr.right - wr.left, wr.bottom - wr.top)
+        };
 
-        // Centre on the monitor the mouse is on (where the gear was clicked).
+        // Centre on the monitor the mouse is on (where the widget is).
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         let _ = GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi);
         let work = mi.rcWork;
+        // The preview strip is left out where the window would not fit.
+        let preview = window_size(CLIENT_H + PREVIEW_H).1 <= work.bottom - work.top;
+        let (win_w, win_h) = window_size(if preview { CLIENT_H + PREVIEW_H } else { CLIENT_H });
         let x = work.left + ((work.right - work.left) - win_w) / 2;
         let y = work.top + ((work.bottom - work.top) - win_h) / 2;
 
@@ -375,7 +406,16 @@ pub fn open(module: HINSTANCE) {
             bold: make_font(600),
             d,
             tab: Cell::new(NO_TAB),
+            oy: Cell::new(0),
         };
+
+        // A live picture of the widget above the tabs, if the screen is tall
+        // enough for the extra height.
+        if preview {
+            b.control(w!("TaskbarMediaPreview"), "", 0, 16, 10, CLIENT_W - 32, PREVIEW_H - 16, ID_PREVIEW, b.font);
+            b.oy.set(PREVIEW_H);
+            SetTimer(Some(parent), PREVIEW_TIMER, 300, None);
+        }
 
         // The tab strip. Only the strip: the controls of each tab sit
         // directly on the window and are shown or hidden as tabs change.
@@ -457,10 +497,18 @@ pub fn open(module: HINSTANCE) {
         if let Ok(target) = GetDlgItem(Some(parent), ID_LAYOUT_TARGET) {
             let _ = EnableWindow(target, cfg.layout2_on);
         }
+        y += 30;
+        b.choice(
+            "Start from",
+            y,
+            ID_PRESET,
+            &["Choose a preset...", "Default", "Minimal", "Compact", "Everything", "Classic"],
+            0,
+        );
         y += 34;
-        b.text("Items on the widget, in order from left to right:", y, 20);
+        b.text("Items, left to right. Drag to reorder, or use the buttons:", y, 20);
         y += 22;
-        b.control(
+        let list = b.control(
             w!("LISTBOX"),
             "",
             LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_BORDER.0 | WS_VSCROLL.0 | WS_TABSTOP.0,
@@ -471,6 +519,7 @@ pub fn open(module: HINSTANCE) {
             ID_ITEMS,
             b.font,
         );
+        let _ = SetWindowSubclass(list, Some(list_proc), 1, 0);
         b.button("Move up", 242, y, 142, ID_ITEM_UP, false);
         b.button("Move down", 242, y + 32, 142, ID_ITEM_DOWN, false);
         b.button("Show / hide", 242, y + 72, 142, ID_ITEM_TOGGLE, false);
@@ -483,8 +532,6 @@ pub fn open(module: HINSTANCE) {
             36,
         );
         y += 42;
-        b.choice("Text width", y, ID_WIDTH, &["Compact", "Normal", "Wide"], cfg.width);
-        y += 30;
         b.choice("Button size", y, ID_BUTTON_SIZE, &["Small", "Medium", "Large"], cfg.button_size);
         y += 30;
         b.choice(
@@ -493,20 +540,6 @@ pub fn open(module: HINSTANCE) {
             ID_BUTTON_GAP,
             &["Compact", "Normal", "Roomy", "Wide", "Extra wide"],
             cfg.button_gap,
-        );
-        y += 30;
-        b.choice(
-            "Text",
-            y,
-            ID_TEXT_LAYOUT,
-            &[
-                "Title \u{00B7} Artist, seek bar below",
-                "Title, seek bar below",
-                "Artist \u{00B7} Title, seek bar below",
-                "Title, artist below",
-                "Title, album below",
-            ],
-            cfg.text_layout,
         );
         y += 34;
         b.checkbox("Stack shuffle above repeat in one column", y, ID_STACK, cfg.stack_extras);
@@ -555,6 +588,22 @@ pub fn open(module: HINSTANCE) {
         b.choice("Seek bar", y, ID_SEEK_SIZE, &["Thin", "Normal", "Thick"], cfg.seek_size);
         y += 30;
         b.choice("Background", y, ID_BACKGROUND, &["None", "Subtle", "Solid"], cfg.background);
+        y += 30;
+        b.choice("Text width", y, ID_WIDTH, &["Compact", "Normal", "Wide"], cfg.width);
+        y += 30;
+        b.choice(
+            "Text",
+            y,
+            ID_TEXT_LAYOUT,
+            &[
+                "Title \u{00B7} Artist, seek bar below",
+                "Title, seek bar below",
+                "Artist \u{00B7} Title, seek bar below",
+                "Title, artist below",
+                "Title, album below",
+            ],
+            cfg.text_layout,
+        );
         y += 34;
         b.button("Custom text color...", 16, y, 180, ID_TEXT_RGB, false);
         b.button("Custom highlight color...", 204, y, 180, ID_ACCENT_RGB, false);
@@ -656,6 +705,19 @@ pub fn open(module: HINSTANCE) {
         y += 24;
         b.button("Open the releases page", 16, y, 180, ID_RELEASES, false);
 
+        y += 46;
+        b.header("Troubleshooting", y);
+        y += 24;
+        b.text(
+            "If the widget ever stops, it restarts itself and notes what happened in a \
+             log file. That file helps when reporting a problem.",
+            y,
+            36,
+        );
+        y += 42;
+        b.button("Open the log folder", 16, y, 180, ID_LOG, false);
+        b.button("Save pictures of the widget", 204, y, 180, ID_PICTURES, false);
+
         // ---- Buttons ----------------------------------------------------
         b.tab.set(NO_TAB);
         b.button("Exit Taskbar Media", 16, BUTTONS_Y, 150, ID_EXIT, false);
@@ -686,6 +748,7 @@ unsafe fn show_tab(tab: usize) {
 /// Fill the layout editor's list from the settings and select row `select`.
 unsafe fn fill_items(parent: HWND, cfg: &Config, select: usize) {
     let Ok(list) = GetDlgItem(Some(parent), ID_ITEMS) else { return };
+    let top = SendMessageW(list, LB_GETTOPINDEX, Some(WPARAM(0)), Some(LPARAM(0))).0.max(0) as usize;
     SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
     let editing = if LAYOUT_TARGET.with(|t| t.get()) == 1 { &cfg.layout2 } else { &cfg.layout };
     for (item, shown) in editing {
@@ -694,7 +757,133 @@ unsafe fn fill_items(parent: HWND, cfg: &Config, select: usize) {
         SendMessageW(list, LB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(text.as_ptr() as isize)));
     }
     let select = select.min(editing.len().saturating_sub(1));
+    SendMessageW(list, LB_SETTOPINDEX, Some(WPARAM(top)), Some(LPARAM(0)));
     SendMessageW(list, LB_SETCURSEL, Some(WPARAM(select)), Some(LPARAM(0)));
+    refresh_preview(parent);
+}
+
+/// Redraw the live preview now.
+unsafe fn refresh_preview(parent: HWND) {
+    if let Ok(preview) = GetDlgItem(Some(parent), ID_PREVIEW) {
+        let _ = InvalidateRect(Some(preview), None, false);
+    }
+}
+
+/// The layout list, with dragging a row to a new position added on top of
+/// the standard list box.
+unsafe extern "system" fn list_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    const MK_LBUTTON: usize = 0x0001;
+    match msg {
+        WM_LBUTTONDOWN => {
+            // Let the list select the row under the mouse; that row is the
+            // one being dragged.
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            let row = SendMessageW(hwnd, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
+            DRAG_ROW.with(|d| d.set((row >= 0).then_some(row as usize)));
+            return result;
+        }
+        WM_MOUSEMOVE if wparam.0 & MK_LBUTTON != 0 => {
+            if let Some(from) = DRAG_ROW.with(|d| d.get()) {
+                // Low word: the row at the mouse. High word: 1 if outside.
+                let hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, Some(WPARAM(0)), Some(lparam)).0 as usize;
+                let (to, outside) = (hit & 0xFFFF, (hit >> 16) & 0xFFFF != 0);
+                if !outside && to != from {
+                    if let Ok(parent) = GetParent(hwnd) {
+                        let other = LAYOUT_TARGET.with(|t| t.get()) == 1;
+                        let cfg = crate::current_config();
+                        let mut layout = if other { cfg.layout2 } else { cfg.layout };
+                        if from < layout.len() && to < layout.len() {
+                            let item = layout.remove(from);
+                            layout.insert(to, item);
+                            crate::update_config(|c| {
+                                if other {
+                                    c.layout2 = layout;
+                                } else {
+                                    c.layout = layout;
+                                }
+                            });
+                            fill_items(parent, &crate::current_config(), to);
+                            DRAG_ROW.with(|d| d.set(Some(to)));
+                        }
+                    }
+                }
+                // The row follows the mouse; the list must not also move
+                // its selection.
+                return LRESULT(0);
+            }
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED => DRAG_ROW.with(|d| d.set(None)),
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+/// The live preview: the widget as it looks with the current settings, on a
+/// strip the color of the taskbar.
+unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let (cw, ch) = (rc.right.max(1), rc.bottom.max(1));
+            let other = LAYOUT_TARGET.with(|t| t.get()) == 1;
+            // One buffer for the whole strip, so it is drawn without flicker.
+            let picture = crate::preview(cw - 12, other);
+            let background = picture.as_ref().map_or(0x0018_191D, |p| p.3);
+            let mut strip = vec![background; (cw * ch) as usize];
+            if let Some((pixels, pw, ph, _)) = picture {
+                let (ox, oy) = ((cw - pw) / 2, (ch - ph) / 2);
+                for y in 0..ph.min(ch) {
+                    let (sy, dy) = (y + (-oy).max(0), y + oy.max(0));
+                    if sy >= ph || dy >= ch {
+                        break;
+                    }
+                    let n = pw.min(cw - ox.max(0)).max(0) as usize;
+                    let src = (sy * pw) as usize;
+                    let dst = (dy * cw + ox.max(0)) as usize;
+                    strip[dst..dst + n].copy_from_slice(&pixels[src..src + n]);
+                }
+            }
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: cw,
+                    biHeight: -ch, // top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            SetDIBitsToDevice(
+                hdc,
+                0,
+                0,
+                cw as u32,
+                ch as u32,
+                0,
+                0,
+                0,
+                ch as u32,
+                strip.as_ptr() as *const c_void,
+                &bmi,
+                DIB_RGB_COLORS,
+            );
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 
 unsafe fn checked(parent: HWND, id: i32) -> bool {
@@ -795,10 +984,10 @@ unsafe fn file_dialog(parent: HWND, save: bool) -> Option<String> {
 
 /// Apply settings that were just imported or reset, and rebuild the window
 /// so that every control shows the new values.
-unsafe fn reopen(hwnd: HWND) {
+unsafe fn reopen(hwnd: HWND, tab: usize) {
     crate::reload_config();
     let module = HINSTANCE(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) as *mut c_void);
-    START_TAB.with(|t| t.set(4));
+    START_TAB.with(|t| t.set(tab));
     let _ = DestroyWindow(hwnd);
     open(module);
 }
@@ -921,6 +1110,30 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             0
         }),
         (ID_ITEMS, LBN_SELCHANGE) => {}
+        (ID_PRESET, CBN_SELCHANGE) => {
+            let preset = selection(hwnd, id);
+            if preset > 0 {
+                let other = LAYOUT_TARGET.with(|t| t.get()) == 1;
+                crate::update_config(|c| c.apply_preset(preset, other));
+                // Several controls now show stale values, so rebuild the
+                // window; but not from inside the list's own message.
+                let _ = PostMessageW(Some(hwnd), WM_APP_REOPEN, WPARAM(1), LPARAM(0));
+            }
+        }
+        (ID_PICTURES, BN_CLICKED) => match crate::save_pictures() {
+            Some((dir, saved)) if saved > 0 => {
+                let path = HSTRING::from(dir.as_os_str());
+                ShellExecuteW(Some(hwnd), w!("open"), &path, None, None, SW_SHOWNORMAL);
+            }
+            _ => message(hwnd, "The pictures could not be saved beside the program."),
+        },
+        (ID_LOG, BN_CLICKED) => {
+            if let Some(dir) = crate::crash::log_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                let path = HSTRING::from(dir.as_os_str());
+                ShellExecuteW(Some(hwnd), w!("open"), &path, None, None, SW_SHOWNORMAL);
+            }
+        }
         (ID_LAYOUT2, BN_CLICKED) => {
             // Turning it on starts the other taskbars from the main layout's
             // current state and switches the editor to them.
@@ -986,7 +1199,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
                     .filter(|bytes| bytes.len() <= 256 * 1024)
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
                 if text.is_some_and(|text| config::import_text(&text)) {
-                    reopen(hwnd);
+                    reopen(hwnd, 4);
                 } else {
                     message(hwnd, "That file does not contain Taskbar Media settings.");
                 }
@@ -1001,7 +1214,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             );
             if answer == IDOK {
                 config::reset_all();
-                reopen(hwnd);
+                reopen(hwnd, 4);
             }
         }
         (ID_RESET_POS, BN_CLICKED) => crate::update_config(|c| {
@@ -1035,6 +1248,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if header.idFrom == ID_TABS as usize && header.code == TCN_SELCHANGE {
                 let tab = SendMessageW(header.hwndFrom, TCM_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
                 show_tab(tab.max(0) as usize);
+            }
+            LRESULT(0)
+        }
+        WM_APP_REOPEN => {
+            reopen(hwnd, wparam.0);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            // Keep the preview in step with the music and the settings.
+            if wparam.0 == PREVIEW_TIMER {
+                refresh_preview(hwnd);
             }
             LRESULT(0)
         }

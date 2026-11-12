@@ -49,8 +49,10 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 - Click the title to copy "Artist - Title"
 - With several players running, use the arrows left of the album art, or
   right-click and choose one under Player ("Automatic" hands the choice back)
-- Right-click and choose under Output device to switch speakers / headphones,
-  or add the output button to the widget in Settings, Layout
+- The right-click menu also copies the track name and opens the volume mixer
+  and output device list
+- Right-click and choose Output device to switch speakers / headphones, or
+  add the output button to the widget in Settings, Layout
 - Shift + mouse wheel over a widget nudges it left or right
 
 ## Settings
@@ -70,7 +72,15 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 - **Behavior**: what the mouse wheel, a click on the album art, a click on
   the title, and the output device button do, and which volume the speaker
   icon reflects
-- **More**: export, import or reset all settings; version and releases
+- **More**: export, import or reset all settings; version and releases;
+  the crash log folder
+
+A live preview at the top of the settings window shows the result as you go,
+the layout list can be reordered by dragging, and presets (Default, Minimal,
+Compact, Everything, Classic) give a starting point.
+
+If the widget ever crashes it restarts itself and writes a line to
+`%LOCALAPPDATA%\TaskbarMedia\crash.log`.
 
 Requires Windows 10 (1809 or later) or Windows 11, 64-bit, with the taskbar at
 the bottom or top of the screen. Taskbars on other displays exist only when
@@ -100,6 +110,10 @@ attaches a freshly built `TaskbarMedia.exe` to it.
 
 Settings live in `HKCU\Software\TaskbarMedia`; "Start with Windows" adds a
 value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+
+## Testing
+
+[docs/TESTING.md](docs/TESTING.md) is a checklist for trying a new build.
 
 ## About the screenshots
 
