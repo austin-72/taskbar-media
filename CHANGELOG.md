@@ -1,6 +1,95 @@
 # Changelog
 
-## 1.8.0
+## 1.9.0 (2026-11-20)
+
+A release of fixes and polish, from a review of every part of the app.
+
+### Added
+- Popups can be used from the keyboard: Up / Down, Home / End and Enter in
+  the menu and device list; in the mixer, Left / Right change the volume and
+  Space or M mutes.
+- Starting the exe while it is already running opens the settings window.
+- A widget that stops responding (not just one that crashes) is noticed
+  within about a minute and restarted.
+- The mixer and the device list say how many rows did not fit.
+- Ctrl+Tab moves between the tabs of the settings window.
+- Releases now come with a SHA-256 checksum file, and every build runs a
+  set of automated tests first.
+
+### Changed
+- Pausing no longer makes the widget jump to something else that has long
+  been making sound in the background; it moves on when another player
+  starts (or had started in the ten seconds before the pause), or after a
+  minute. Choosing "Automatic" takes effect at once.
+- A layout preset is applied with an Apply button, after a confirmation,
+  rather than the moment it is highlighted in the list.
+- When nothing is playing, the app checks the taskbar a fifth as often.
+- Menu and device rows act when the mouse button is released on them, like
+  ordinary menus (slide off to cancel).
+- A layout preset applied to "Other taskbars" only changes those taskbars.
+- On a full Windows 11 taskbar the widget shrinks in more steps (narrower
+  text, tighter and smaller buttons, then art and buttons only).
+- Text stays more readable on a small taskbar.
+- Enter no longer closes the settings window from a list or drop-down.
+- "Start with Windows" repairs itself when the exe it pointed at has been
+  moved or renamed, and Settings says when another copy is the one set to
+  start.
+
+### Fixed
+- A player that stopped answering could freeze the widget for good; every
+  request to a player now gives up after two seconds.
+- Play / pause did nothing with players that offer "play" and "pause" but
+  not the combined toggle.
+- Album art could stay on the previous track's cover, or be drawn half
+  loaded.
+- The wheel over the widget did not change Firefox's own volume or that of
+  installed web apps (it fell back to the system volume), and a touchpad
+  scroll slammed the volume to 0 or 100.
+- "Repeat one" was hard to tell from "repeat all": the "1" is now clear of
+  the arrow, and sits beside the icon when shuffle and repeat are stacked.
+- With the time labels turned off, a click on the left edge of the button
+  after the seek bar jumped to the end of the track.
+- "Seek bar on its own" showed the artist without the title, or nothing,
+  for players that report no timeline.
+- A switch of output device that only half worked is undone, instead of
+  leaving Windows and the widget showing different devices.
+- Wheel-up on a muted player now un-mutes it.
+- Closing the mixer while dragging a slider could leave a ghost of it that
+  would not go away.
+- Alt+F4 with a popup open destroyed the popup window, so no popup opened
+  again until restart; closing the app from outside (for example `taskkill`
+  without `/f`) could leave an invisible process that blocked restarting.
+- Popups could run off the screen with many apps, devices or players, and
+  at 125% or 175% scaling the highlighted row drifted away from the mouse.
+- Drawing is now aligned to whole pixels at every scaling (sharper album
+  art and seek bar), and long titles scroll smoothly instead of in jerks.
+- The highlight color is adjusted when it would be hard to see against the
+  taskbar.
+- Clicks at the right edge of a button next to the album art, settings
+  button or player switcher went to the neighbour.
+- The widget could become empty and unclickable (every item hidden, or only
+  unavailable items shown); a layout always shows something now.
+- With "Title on its own", the artist was not shown at all.
+- After a crash or Task Manager kill on Windows 10, the taskbar's app area
+  stayed narrowed.
+- A full-screen browser video could be covered when the widget had been
+  nudged to the right.
+- The tray icon could be missing after signing in, and leaked an icon handle
+  each time it was added.
+- The settings window: it jumped back to the middle of the screen and to
+  "Main taskbar" after choosing a preset; it was the wrong size on a display
+  scaled differently from the main one; a stray gap in the text on the
+  Behavior tab; a row could not be dragged past the visible part of the
+  layout list; a chosen display or output device that was unplugged showed
+  as "not set"; fonts leaked each time it opened.
+- Exporting settings from a fresh install wrote a file that could not be
+  imported, and importing an unrelated file could wipe the settings.
+- The update check gave up for six hours when there was no network at
+  sign-in, and could hang for ever on a stalled connection.
+- The crash log is now written safely even when the crash is in memory
+  allocation.
+
+## 1.8.0 (2026-11-11)
 
 ### Added
 - Live preview at the top of the settings window: the widget as it will
@@ -18,7 +107,7 @@
 ### Changed
 - "Text width" and "Text" moved from the Layout tab to Appearance.
 
-## 1.7.0
+## 1.7.0 (2026-11-11)
 
 ### Added
 - Button spacing setting: compact, normal, roomy, wide or extra wide.
@@ -31,7 +120,7 @@
   changes width as these come and go. The old behaviour is available as
   "Hide buttons that can't be used" in Settings, Layout.
 
-## 1.6.0
+## 1.6.0 (2026-11-10)
 
 ### Added
 - Volume button on the widget. Clicking it opens a mixer above the taskbar
@@ -47,7 +136,7 @@
 - The output device button's speaker icon is now a loudspeaker cabinet, so
   it is not confused with the volume icon.
 
-## 1.5.0
+## 1.5.0 (2026-11-10)
 
 ### Added
 - Player switcher: up and down arrows just left of the album art that step
@@ -61,14 +150,14 @@
 - With the settings button hidden, an available update is marked with a dot
   on the corner of the album art.
 
-## 1.4.1
+## 1.4.1 (2026-11-10)
 
 ### Fixed
 - The widget no longer draws over full-screen video in a browser.
 - The widget no longer stays hidden behind the taskbar after leaving
   full-screen.
 
-## 1.4.0
+## 1.4.0 (2026-11-10)
 
 ### Added
 - "Title on its own" and "Seek bar on its own" layout items, so the title
@@ -84,7 +173,7 @@
   buttons and the About section.
 - README screenshots redrawn from the widget's actual layout code.
 
-## 1.3.0
+## 1.3.0 (2026-11-10)
 
 ### Added
 - Output device button: an optional widget item that switches where sound
@@ -95,7 +184,7 @@
   with the button hidden.
 - The widget briefly names the new device after a switch.
 
-## 1.2.0
+## 1.2.0 (2026-11-10)
 
 ### Added
 - Layout editor: choose which items show (settings button, album art,
@@ -114,7 +203,7 @@
 ### Changed
 - The settings window now has tabs: General, Layout, Appearance, Behavior.
 
-## 1.1.0
+## 1.1.0 (2026-11-10)
 
 ### Added
 - Shuffle and repeat buttons, shown for players that support them.
@@ -134,7 +223,7 @@
 - MSVC builds include the C runtime, so the exe has no VCRUNTIME140.dll
   dependency.
 
-## 1.0.0
+## 1.0.0 (2026-11-10)
 
 ### Added
 - Tray icon with Settings, Open player and Exit, so the app can be reached
@@ -157,7 +246,7 @@
 - The exe is now built as `TaskbarMedia.exe` directly.
 - DPI awareness and themed controls are declared in the exe's manifest.
 
-## 0.1.0
+## 0.1.0 (2026-11-09)
 
 - First release: album art, title and artist, previous / play-pause / next,
   seek bar, click the art to open the player.

@@ -17,6 +17,8 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
+      VALUE "CompanyName", "Taskbar Media (open source)"
+      VALUE "LegalCopyright", "Copyright (c) 2026 Austin. MIT License."
       VALUE "FileDescription", "Taskbar Media"
       VALUE "ProductName", "Taskbar Media"
       VALUE "FileVersion", VERSION_TEXT

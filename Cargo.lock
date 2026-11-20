@@ -164,10 +164,11 @@ dependencies = [
 
 [[package]]
 name = "taskbar-media"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "embed-resource",
  "windows",
+ "windows-future",
 ]
 
 [[package]]

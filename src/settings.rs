@@ -1,4 +1,4 @@
-//! The settings window: four tabs of options. Every change applies
+//! The settings window: five tabs of options. Every change applies
 //! immediately and is saved.
 
 use std::cell::{Cell, RefCell};
@@ -11,19 +11,19 @@ use windows::Win32::UI::Controls::Dialogs::{
     ChooseColorW, GetOpenFileNameW, GetSaveFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
     OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, EndPaint, EnumDisplayMonitors, GetMonitorInfoW, GetSysColorBrush,
+    BeginPaint, CreateFontW, DeleteObject, EndPaint, EnumDisplayMonitors, GetMonitorInfoW, GetSysColorBrush,
     InvalidateRect, MonitorFromPoint, SetDIBitsToDevice, BITMAPINFO, BITMAPINFOHEADER,
     COLOR_3DFACE, DIB_RGB_COLORS, HDC, HFONT, HMONITOR, MONITORINFO, MONITORINFOEXW,
     MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, NMHDR,
     TCIF_TEXT, TCITEMW,
 };
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForSystem, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{self, Config, DISPLAY_ALL, DISPLAY_MAIN, DISPLAY_ONE};
@@ -66,6 +66,9 @@ const ID_PICTURES: i32 = 161;
 /// message has been dealt with.
 const WM_APP_REOPEN: u32 = WM_APP + 10;
 const ID_PREVIEW: i32 = 151;
+const ID_PRESET_APPLY: i32 = 152;
+/// Timer on the layout list while a row is being dragged.
+const DRAG_TIMER: usize = 9;
 const PREVIEW_TIMER: usize = 7;
 const ID_STACK: i32 = 109;
 const ID_HIDE_UNUSABLE: i32 = 160;
@@ -135,12 +138,26 @@ thread_local! {
     /// Device ids behind the rows of the two output-device lists (row 0 is
     /// "not set").
     static OUTPUTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    /// Which layout the Layout tab is editing: 0 main taskbar, 1 the others.
     /// The row of the layout list being dragged to a new position.
     static DRAG_ROW: Cell<Option<usize>> = const { Cell::new(None) };
     /// The tab to show when the window next opens.
     static START_TAB: Cell<usize> = const { Cell::new(0) };
+    /// Which layout the Layout tab is editing: 0 main taskbar, 1 the others.
     static LAYOUT_TARGET: Cell<usize> = const { Cell::new(0) };
+    /// The control that had the keyboard focus when the window was last
+    /// left for another, to give it back on return.
+    static LAST_FOCUS: Cell<isize> = const { Cell::new(0) };
+    /// Where to put the window when it is rebuilt (after a preset, an
+    /// import, a reset or a change of display scaling), so that it stays
+    /// where it was instead of jumping back to the middle of the screen.
+    /// (left, top, centre x, centre y): the centre says which display.
+    static REOPEN_AT: Cell<Option<(i32, i32, i32, i32)>> = const { Cell::new(None) };
+    /// The fonts made for the open window, deleted when it closes.
+    static FONT_HANDLES: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
+    /// The window is being dragged, and its display scaling changed on the way.
+    static MOVING: Cell<bool> = const { Cell::new(false) };
+    static DPI_PENDING: Cell<bool> = const { Cell::new(false) };
+
     /// Colors the user saved in the color picker, kept while the app runs.
     static CUSTOM_COLORS: RefCell<[COLORREF; 16]> = const { RefCell::new([COLORREF(0x00FF_FFFF); 16]) };
     /// Every tab's controls, as (tab index, window handle).
@@ -342,25 +359,50 @@ pub fn open(module: HINSTANCE) {
         }
 
         let cfg = crate::current_config();
-        let d = GetDpiForSystem().max(96) as f32 / 96.0;
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let window_size = |client_h: i32| {
-            let mut wr = RECT { left: 0, top: 0, right: (CLIENT_W as f32 * d) as i32, bottom: (client_h as f32 * d) as i32 };
-            let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
-            (wr.right - wr.left, wr.bottom - wr.top)
-        };
 
-        // Centre on the monitor the mouse is on (where the widget is).
+        // On the monitor the mouse is on (where the widget is), or, when the
+        // window is being rebuilt, wherever it was.
+        let keep = REOPEN_AT.with(|at| at.take());
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
+        // (The display the middle of the window was on: that is the one
+        // Windows considers it to be on, and whose scaling it should have.)
+        if let Some((_, _, cx, cy)) = keep {
+            pt = POINT { x: cx, y: cy };
+        }
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        let _ = GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi);
+        let _ = GetMonitorInfoW(monitor, &mut mi);
         let work = mi.rcWork;
+
+        // Sized for that monitor's own scaling, which can differ from the
+        // main display's.
+        let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+        let dpi = match GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) {
+            Ok(()) if dpi_x > 0 => dpi_x,
+            _ => GetDpiForSystem(),
+        }
+        .max(96);
+        let d = dpi as f32 / 96.0;
+        let window_size = |client_h: i32| {
+            let mut wr = RECT { left: 0, top: 0, right: (CLIENT_W as f32 * d) as i32, bottom: (client_h as f32 * d) as i32 };
+            if AdjustWindowRectExForDpi(&mut wr, style, false, WINDOW_EX_STYLE(0), dpi).is_err() {
+                let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
+            }
+            (wr.right - wr.left, wr.bottom - wr.top)
+        };
         // The preview strip is left out where the window would not fit.
         let preview = window_size(CLIENT_H + PREVIEW_H).1 <= work.bottom - work.top;
         let (win_w, win_h) = window_size(if preview { CLIENT_H + PREVIEW_H } else { CLIENT_H });
-        let x = work.left + ((work.right - work.left) - win_w) / 2;
-        let y = work.top + ((work.bottom - work.top) - win_h) / 2;
+        let (x, y) = keep.map(|(x, y, _, _)| (x, y)).unwrap_or((
+            work.left + ((work.right - work.left) - win_w) / 2,
+            work.top + ((work.bottom - work.top) - win_h) / 2,
+        ));
+        // Always with its title bar on the screen, and as much of the rest
+        // as fits.
+        let x = x.min(work.right - win_w).max(work.left);
+        let y = y.min(work.bottom - win_h).max(work.top);
 
         let Ok(parent) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -399,11 +441,13 @@ pub fn open(module: HINSTANCE) {
                 w!("Segoe UI"),
             )
         };
+        let (font, bold) = (make_font(400), make_font(600));
+        FONT_HANDLES.with(|f| f.borrow_mut().extend([font.0 as isize, bold.0 as isize]));
         let b = Builder {
             parent,
             module,
-            font: make_font(400),
-            bold: make_font(600),
+            font,
+            bold,
             d,
             tab: Cell::new(NO_TAB),
             oy: Cell::new(0),
@@ -439,7 +483,13 @@ pub fn open(module: HINSTANCE) {
         // ---- General ----------------------------------------------------
         b.tab.set(0);
         let mut y = TOP;
-        b.checkbox("Start with Windows", y, ID_AUTOSTART, config::autostart_enabled());
+        // If another copy of the exe is the one set to start, say so: the
+        // tick alone would suggest it is this one.
+        let startup_label = match config::autostart_elsewhere() {
+            Some(_) => "Start with Windows (another copy is set; re-tick for this one)",
+            None => "Start with Windows",
+        };
+        b.checkbox(startup_label, y, ID_AUTOSTART, config::autostart_enabled());
         y += 26;
         b.checkbox("Hide the widget while playback is paused", y, ID_HIDE_PAUSED, cfg.hide_paused);
         y += 26;
@@ -471,7 +521,16 @@ pub fn open(module: HINSTANCE) {
                 selected = i + 2;
             }
         }
-        DISPLAYS.with(|v| *v.borrow_mut() = list.into_iter().map(|m| m.device).collect());
+        let mut devices: Vec<String> = list.into_iter().map(|m| m.device).collect();
+        // The chosen display is unplugged right now: keep showing it as the
+        // choice (the widget uses the main taskbar until it is back).
+        if cfg.display_mode == DISPLAY_ONE && selected < 2 && !cfg.display_name.is_empty() {
+            let number = cfg.display_name.trim_start_matches("\\\\.\\DISPLAY");
+            items.push(format!("Display {number} only (not connected)"));
+            devices.push(cfg.display_name.clone());
+            selected = items.len() - 1;
+        }
+        DISPLAYS.with(|v| *v.borrow_mut() = devices);
         b.choice_owned("Show on", y, ID_DISPLAY, &items, selected);
         y += 32;
         b.text(
@@ -490,21 +549,40 @@ pub fn open(module: HINSTANCE) {
         // ---- Layout -----------------------------------------------------
         b.tab.set(1);
         let mut y = TOP;
-        LAYOUT_TARGET.with(|t| t.set(0));
+        // Which layout is being edited survives a rebuild of the window (a
+        // preset applied to the other taskbars must not flip the editor
+        // back to the main one).
+        if !cfg.layout2_on {
+            LAYOUT_TARGET.with(|t| t.set(0));
+        }
+        let editing = LAYOUT_TARGET.with(|t| t.get()) as u32;
         b.checkbox("Taskbars on other displays use their own layout", y, ID_LAYOUT2, cfg.layout2_on);
         y += 28;
-        b.choice("Editing", y, ID_LAYOUT_TARGET, &["Main taskbar", "Other taskbars"], 0);
+        b.choice("Editing", y, ID_LAYOUT_TARGET, &["Main taskbar", "Other taskbars"], editing);
         if let Ok(target) = GetDlgItem(Some(parent), ID_LAYOUT_TARGET) {
             let _ = EnableWindow(target, cfg.layout2_on);
         }
         y += 30;
-        b.choice(
-            "Start from",
+        // A preset is applied with the button, not by merely moving through
+        // the list (which the arrow keys and the mouse wheel also do).
+        b.control(w!("STATIC"), "Start from", 0, 16, y + 4, 126, 20, -1, b.font);
+        let presets = b.control(
+            w!("COMBOBOX"),
+            "",
+            CBS_DROPDOWNLIST | WS_VSCROLL.0 | WS_TABSTOP.0,
+            146,
             y,
+            160,
+            300,
             ID_PRESET,
-            &["Choose a preset...", "Default", "Minimal", "Compact", "Everything", "Classic"],
-            0,
+            b.font,
         );
+        for name in ["Choose a preset...", "Default", "Minimal", "Compact", "Everything", "Classic"] {
+            let text = HSTRING::from(name);
+            SendMessageW(presets, CB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(text.as_ptr() as isize)));
+        }
+        SendMessageW(presets, CB_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+        b.control(w!("BUTTON"), "Apply", WS_TABSTOP.0, 312, y - 1, 72, 26, ID_PRESET_APPLY, b.font);
         y += 34;
         b.text("Items, left to right. Drag to reorder, or use the buttons:", y, 20);
         y += 22;
@@ -545,7 +623,7 @@ pub fn open(module: HINSTANCE) {
         b.checkbox("Stack shuffle above repeat in one column", y, ID_STACK, cfg.stack_extras);
         y += 26;
         b.checkbox(
-            "Hide buttons that can't be used (otherwise shown greyed out)",
+            "Hide buttons that can't be used right now",
             y,
             ID_HIDE_UNUSABLE,
             cfg.hide_unusable,
@@ -653,7 +731,7 @@ pub fn open(module: HINSTANCE) {
         b.header("Output device button", y);
         y += 24;
         b.text(
-            "Turn the button on in the Layout tab. Right-clicking it always lists the              devices.",
+            "Turn the button on in the Layout tab. Right-clicking it always lists the devices.",
             y,
             36,
         );
@@ -667,13 +745,26 @@ pub fn open(module: HINSTANCE) {
         );
         let outputs = crate::devices::list();
         let mut names: Vec<String> = vec!["(not set)".into()];
-        names.extend(outputs.iter().map(|d| d.name.clone()));
-        let row_of = |id: &str| outputs.iter().position(|d| d.id == id).map_or(0, |i| i + 1);
+        // Two devices can share a name; number the repeats so they can be
+        // told apart.
+        for (i, d) in outputs.iter().enumerate() {
+            let earlier = outputs[..i].iter().filter(|o| o.name == d.name).count();
+            names.push(if earlier > 0 { format!("{} ({})", d.name, earlier + 1) } else { d.name.clone() });
+        }
+        let mut ids: Vec<String> = outputs.into_iter().map(|d| d.id).collect();
+        // A chosen device that is unplugged right now stays chosen.
+        for saved in [&cfg.output_a, &cfg.output_b] {
+            if !saved.is_empty() && !ids.contains(saved) {
+                ids.push(saved.clone());
+                names.push("Saved device (not connected)".into());
+            }
+        }
+        let row_of = |id: &str| ids.iter().position(|d| d == id).map_or(0, |i| i + 1);
         y += 30;
         b.choice_owned("First device", y, ID_OUTPUT_A, &names, row_of(&cfg.output_a));
         y += 30;
         b.choice_owned("Second device", y, ID_OUTPUT_B, &names, row_of(&cfg.output_b));
-        OUTPUTS.with(|v| *v.borrow_mut() = outputs.into_iter().map(|d| d.id).collect());
+        OUTPUTS.with(|v| *v.borrow_mut() = ids);
 
         // ---- More --------------------------------------------------------
         b.tab.set(4);
@@ -721,7 +812,7 @@ pub fn open(module: HINSTANCE) {
         // ---- Buttons ----------------------------------------------------
         b.tab.set(NO_TAB);
         b.button("Exit Taskbar Media", 16, BUTTONS_Y, 150, ID_EXIT, false);
-        b.button("Close", CLIENT_W - 16 - 90, BUTTONS_Y, 90, ID_CLOSE, true);
+        b.button("Close", CLIENT_W - 16 - 90, BUTTONS_Y, 90, ID_CLOSE, false);
 
         fill_items(parent, &cfg, 0);
         // Reopened after an import or reset: come back on the same tab.
@@ -732,6 +823,31 @@ pub fn open(module: HINSTANCE) {
         }
         let _ = ShowWindow(parent, SW_SHOWNORMAL);
         let _ = SetForegroundWindow(parent);
+        // Somewhere for the keyboard to start: the tab strip (Left / Right
+        // change tab, Tab moves into the tab's controls).
+        let _ = SetFocus(Some(tabs));
+    }
+}
+
+/// Ctrl+Tab / Ctrl+Shift+Tab: show the next or previous tab.
+pub fn switch_tab(back: bool) {
+    unsafe {
+        let parent = hwnd();
+        let Ok(tabs) = GetDlgItem(Some(parent), ID_TABS) else { return };
+        let count = TAB_NAMES.len() as isize;
+        let current = SendMessageW(tabs, TCM_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0.max(0);
+        let next = (current + if back { count - 1 } else { 1 }) % count;
+        SendMessageW(tabs, TCM_SETCURSEL, Some(WPARAM(next as usize)), Some(LPARAM(0)));
+        show_tab(next as usize);
+        let _ = SetFocus(Some(tabs));
+    }
+}
+
+/// The tab that is showing.
+unsafe fn current_tab(parent: HWND) -> usize {
+    match GetDlgItem(Some(parent), ID_TABS) {
+        Ok(tabs) => SendMessageW(tabs, TCM_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0.max(0) as usize,
+        Err(_) => 0,
     }
 }
 
@@ -769,6 +885,28 @@ unsafe fn refresh_preview(parent: HWND) {
     }
 }
 
+/// Move the dragged row of the layout list from `from` to `to`.
+unsafe fn drag_row_to(list: HWND, from: usize, to: usize) {
+    let Ok(parent) = GetParent(list) else { return };
+    let other = LAYOUT_TARGET.with(|t| t.get()) == 1;
+    let cfg = crate::current_config();
+    let mut layout = if other { cfg.layout2 } else { cfg.layout };
+    if from == to || from >= layout.len() || to >= layout.len() {
+        return;
+    }
+    let item = layout.remove(from);
+    layout.insert(to, item);
+    crate::update_config(move |c| {
+        if other {
+            c.layout2 = layout;
+        } else {
+            c.layout = layout;
+        }
+    });
+    fill_items(parent, &crate::current_config(), to);
+    DRAG_ROW.with(|d| d.set(Some(to)));
+}
+
 /// The layout list, with dragging a row to a new position added on top of
 /// the standard list box.
 unsafe extern "system" fn list_proc(
@@ -787,6 +925,9 @@ unsafe extern "system" fn list_proc(
             let result = DefSubclassProc(hwnd, msg, wparam, lparam);
             let row = SendMessageW(hwnd, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
             DRAG_ROW.with(|d| d.set((row >= 0).then_some(row as usize)));
+            // While the button is down, a timer keeps the row moving when
+            // the mouse is held still past the top or bottom of the list.
+            SetTimer(Some(hwnd), DRAG_TIMER, 140, None);
             return result;
         }
         WM_MOUSEMOVE if wparam.0 & MK_LBUTTON != 0 => {
@@ -794,32 +935,40 @@ unsafe extern "system" fn list_proc(
                 // Low word: the row at the mouse. High word: 1 if outside.
                 let hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, Some(WPARAM(0)), Some(lparam)).0 as usize;
                 let (to, outside) = (hit & 0xFFFF, (hit >> 16) & 0xFFFF != 0);
-                if !outside && to != from {
-                    if let Ok(parent) = GetParent(hwnd) {
-                        let other = LAYOUT_TARGET.with(|t| t.get()) == 1;
-                        let cfg = crate::current_config();
-                        let mut layout = if other { cfg.layout2 } else { cfg.layout };
-                        if from < layout.len() && to < layout.len() {
-                            let item = layout.remove(from);
-                            layout.insert(to, item);
-                            crate::update_config(|c| {
-                                if other {
-                                    c.layout2 = layout;
-                                } else {
-                                    c.layout = layout;
-                                }
-                            });
-                            fill_items(parent, &crate::current_config(), to);
-                            DRAG_ROW.with(|d| d.set(Some(to)));
-                        }
-                    }
+                if !outside {
+                    drag_row_to(hwnd, from, to);
                 }
                 // The row follows the mouse; the list must not also move
                 // its selection.
                 return LRESULT(0);
             }
         }
-        WM_LBUTTONUP | WM_CAPTURECHANGED => DRAG_ROW.with(|d| d.set(None)),
+        WM_TIMER if wparam.0 == DRAG_TIMER => {
+            // Past the top or bottom edge: the list has more rows than it
+            // shows, so move the row a step that way (the list scrolls to
+            // keep it in view).
+            if let Some(from) = DRAG_ROW.with(|d| d.get()) {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+                let mut client = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client);
+                if pt.y < 0 && from > 0 {
+                    drag_row_to(hwnd, from, from - 1);
+                } else if pt.y >= client.bottom {
+                    drag_row_to(hwnd, from, from + 1);
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED => {
+            DRAG_ROW.with(|d| d.set(None));
+            let _ = KillTimer(Some(hwnd), DRAG_TIMER);
+        }
+        WM_NCDESTROY => {
+            let _ = KillTimer(Some(hwnd), DRAG_TIMER);
+            let _ = RemoveWindowSubclass(hwnd, Some(list_proc), 1);
+        }
         _ => {}
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
@@ -838,7 +987,7 @@ unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let (cw, ch) = (rc.right.max(1), rc.bottom.max(1));
             let other = LAYOUT_TARGET.with(|t| t.get()) == 1;
             // One buffer for the whole strip, so it is drawn without flicker.
-            let picture = crate::preview(cw - 12, other);
+            let picture = crate::preview(cw - 12, ch - 6, other);
             let background = picture.as_ref().map_or(0x0018_191D, |p| p.3);
             let mut strip = vec![background; (cw * ch) as usize];
             if let Some((pixels, pw, ph, _)) = picture {
@@ -903,6 +1052,11 @@ unsafe fn selection(parent: HWND, id: i32) -> usize {
 
 /// Change the layout with `edit(layout, selected row)`, which returns the row
 /// to select afterwards, then save, apply and refresh the list.
+/// The settings window, as the owner of a message box.
+fn parent_for_message() -> HWND {
+    hwnd()
+}
+
 unsafe fn edit_layout(parent: HWND, edit: impl FnOnce(&mut Vec<(u8, bool)>, usize) -> usize) {
     let Ok(list) = GetDlgItem(Some(parent), ID_ITEMS) else { return };
     let row = SendMessageW(list, LB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
@@ -913,7 +1067,7 @@ unsafe fn edit_layout(parent: HWND, edit: impl FnOnce(&mut Vec<(u8, bool)>, usiz
         return;
     }
     let select = edit(&mut layout, row as usize);
-    crate::update_config(|c| {
+    crate::update_config(move |c| {
         if other {
             c.layout2 = layout;
         } else {
@@ -988,6 +1142,12 @@ unsafe fn reopen(hwnd: HWND, tab: usize) {
     crate::reload_config();
     let module = HINSTANCE(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) as *mut c_void);
     START_TAB.with(|t| t.set(tab));
+    // The new window goes where this one is.
+    let mut at = RECT::default();
+    if GetWindowRect(hwnd, &mut at).is_ok() {
+        let centre = ((at.left + at.right) / 2, (at.top + at.bottom) / 2);
+        REOPEN_AT.with(|keep| keep.set(Some((at.left, at.top, centre.0, centre.1))));
+    }
     let _ = DestroyWindow(hwnd);
     open(module);
 }
@@ -1016,44 +1176,54 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             _ => None,
         };
         if let Some(field) = field {
-            crate::update_config(|c| *field(c) = v);
+            crate::update_config(move |c| *field(c) = v);
             return;
         }
     }
 
     match (id, code) {
-        (ID_AUTOSTART, BN_CLICKED) => config::set_autostart(checked(hwnd, id)),
+        (ID_AUTOSTART, BN_CLICKED) => {
+            let want = checked(hwnd, id);
+            if !config::set_autostart(want) {
+                // Blocked (a policy, or security software): show the truth.
+                if let Ok(control) = GetDlgItem(Some(hwnd), id) {
+                    let now = config::autostart_enabled();
+                    SendMessageW(control, BM_SETCHECK, Some(WPARAM(now as usize)), Some(LPARAM(0)));
+                }
+                message(hwnd, "Windows did not allow the \"Start with Windows\" setting to be changed.");
+            }
+        }
         (ID_HIDE_PAUSED, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.hide_paused = v);
+            crate::update_config(move |c| c.hide_paused = v);
         }
         (ID_TRAY, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.tray_icon = v);
+            crate::update_config(move |c| c.tray_icon = v);
         }
         (ID_UPDATES, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.check_updates = v);
+            crate::update_config(move |c| c.check_updates = v);
         }
         (ID_AVOID, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.avoid_apps = v);
+            crate::update_config(move |c| c.avoid_apps = v);
         }
         (ID_SHOW_TIMES, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.show_times = v);
+            crate::update_config(move |c| c.show_times = v);
         }
         (ID_SCROLL, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.scroll_titles = v);
+            crate::update_config(move |c| c.scroll_titles = v);
         }
         (ID_SOURCE, CBN_SELCHANGE) => {
             let v = selection(hwnd, id) == 1;
-            crate::update_config(|c| c.spotify_only = v);
+            crate::update_config(move |c| c.spotify_only = v);
         }
         (ID_RENDER, CBN_SELCHANGE) => {
             let v = selection(hwnd, id) == 0;
-            crate::update_config(|c| c.smooth = v);
+            crate::update_config(move |c| c.smooth = v);
         }
         (ID_DISPLAY, CBN_SELCHANGE) => {
             let sel = selection(hwnd, id);
@@ -1062,7 +1232,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             } else {
                 None
             };
-            crate::update_config(|c| match (sel, device) {
+            crate::update_config(move |c| match (sel, device) {
                 (1, _) => c.display_mode = DISPLAY_ALL,
                 (_, Some(name)) => {
                     c.display_mode = DISPLAY_ONE;
@@ -1079,7 +1249,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             } else {
                 OUTPUTS.with(|v| v.borrow().get(row - 1).cloned()).unwrap_or_default()
             };
-            crate::update_config(|c| {
+            crate::update_config(move |c| {
                 if id == ID_OUTPUT_A {
                     c.output_a = device;
                 } else {
@@ -1103,6 +1273,12 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
         }),
         (ID_ITEM_TOGGLE, BN_CLICKED) => edit_layout(hwnd, |layout, row| {
             layout[row].1 = !layout[row].1;
+            // Something has to stay: a widget showing nothing could not
+            // even be right-clicked.
+            if !layout.iter().any(|(_, shown)| *shown) {
+                layout[row].1 = true;
+                message(parent_for_message(), "At least one item has to stay shown.");
+            }
             row
         }),
         (ID_ITEM_RESET, BN_CLICKED) => edit_layout(hwnd, |layout, _| {
@@ -1110,14 +1286,25 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             0
         }),
         (ID_ITEMS, LBN_SELCHANGE) => {}
-        (ID_PRESET, CBN_SELCHANGE) => {
-            let preset = selection(hwnd, id);
-            if preset > 0 {
+        (ID_PRESET_APPLY, BN_CLICKED) => {
+            let preset = selection(hwnd, ID_PRESET);
+            if preset == 0 {
+                message(hwnd, "Choose a preset from the list first.");
+            } else {
                 let other = LAYOUT_TARGET.with(|t| t.get()) == 1;
-                crate::update_config(|c| c.apply_preset(preset, other));
-                // Several controls now show stale values, so rebuild the
-                // window; but not from inside the list's own message.
-                let _ = PostMessageW(Some(hwnd), WM_APP_REOPEN, WPARAM(1), LPARAM(0));
+                // It replaces what is there, with no way back: say so.
+                let question = if other {
+                    w!("Replace the layout of the other taskbars with this preset?")
+                } else {
+                    w!("Replace the layout with this preset? It also resets text width, what the text shows, button size, button spacing and stacking.")
+                };
+                let answer = MessageBoxW(Some(hwnd), question, w!("Taskbar Media"), MB_OKCANCEL | MB_ICONQUESTION);
+                if answer == IDOK {
+                    crate::update_config(move |c| c.apply_preset(preset, other));
+                    // Several controls now show stale values, so rebuild
+                    // the window; but not from inside this message.
+                    let _ = PostMessageW(Some(hwnd), WM_APP_REOPEN, WPARAM(1), LPARAM(0));
+                }
             }
         }
         (ID_PICTURES, BN_CLICKED) => match crate::save_pictures() {
@@ -1138,7 +1325,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
             // Turning it on starts the other taskbars from the main layout's
             // current state and switches the editor to them.
             let on = checked(hwnd, id);
-            crate::update_config(|c| {
+            crate::update_config(move |c| {
                 if on && !c.layout2_on {
                     c.layout2 = c.layout.clone();
                 }
@@ -1157,19 +1344,19 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
         }
         (ID_STACK, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.stack_extras = v);
+            crate::update_config(move |c| c.stack_extras = v);
         }
         (ID_HIDE_UNUSABLE, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.hide_unusable = v);
+            crate::update_config(move |c| c.hide_unusable = v);
         }
         (ID_HOVER, BN_CLICKED) => {
             let v = checked(hwnd, id);
-            crate::update_config(|c| c.hover_card = v);
+            crate::update_config(move |c| c.hover_card = v);
         }
         (ID_TEXT_RGB, BN_CLICKED) => {
             if let Some(color) = pick_color(hwnd, crate::current_config().text_rgb) {
-                crate::update_config(|c| {
+                crate::update_config(move |c| {
                     c.text_rgb = color;
                     c.text_color = 3;
                 });
@@ -1178,7 +1365,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
         }
         (ID_ACCENT_RGB, BN_CLICKED) => {
             if let Some(color) = pick_color(hwnd, crate::current_config().accent_rgb) {
-                crate::update_config(|c| {
+                crate::update_config(move |c| {
                     c.accent_rgb = color;
                     c.accent_mode = 3;
                 });
@@ -1187,6 +1374,9 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
         }
         (ID_EXPORT, BN_CLICKED) => {
             if let Some(path) = file_dialog(hwnd, true) {
+                // Settings never changed are not in the registry yet; write
+                // them all, so the file is complete (and can be imported).
+                crate::current_config().save();
                 if std::fs::write(&path, config::export_text()).is_err() {
                     message(hwnd, "The settings file could not be written there.");
                 }
@@ -1194,10 +1384,16 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
         }
         (ID_IMPORT, BN_CLICKED) => {
             if let Some(path) = file_dialog(hwnd, false) {
-                let text = std::fs::read(&path)
-                    .ok()
-                    .filter(|bytes| bytes.len() <= 256 * 1024)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+                // (A file re-saved from Notepad as "Unicode" is UTF-16.)
+                let text = std::fs::read(&path).ok().filter(|bytes| bytes.len() <= 256 * 1024).map(|bytes| {
+                    if bytes.starts_with(&[0xFF, 0xFE]) {
+                        let wide: Vec<u16> =
+                            bytes[2..].chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+                        String::from_utf16_lossy(&wide)
+                    } else {
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    }
+                });
                 if text.is_some_and(|text| config::import_text(&text)) {
                     reopen(hwnd, 4);
                 } else {
@@ -1217,7 +1413,7 @@ unsafe fn on_command(hwnd: HWND, id: i32, code: u32) {
                 reopen(hwnd, 4);
             }
         }
-        (ID_RESET_POS, BN_CLICKED) => crate::update_config(|c| {
+        (ID_RESET_POS, BN_CLICKED) => crate::update_config(move |c| {
             c.offset = 0;
             c.offset2 = 0;
         }),
@@ -1235,10 +1431,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
-            // Enter / Esc arrive as IDOK / IDCANCEL through IsDialogMessage.
-            if id == 1 || id == 2 {
+            // Esc arrives as IDCANCEL through IsDialogMessage and closes the
+            // window. Enter arrives as IDOK unless a button has the focus
+            // (then it presses that button); from a list or a drop-down it
+            // must not close the window, so it is ignored.
+            if id == 2 {
                 let _ = DestroyWindow(hwnd);
-            } else {
+            } else if id != 1 {
                 on_command(hwnd, id, code);
             }
             LRESULT(0)
@@ -1266,10 +1465,57 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
+        // Dragged to (or now on) a display with different scaling: rebuild
+        // at the new size, once the drag is over.
+        // Leaving for another window and coming back keeps the keyboard's
+        // place among the controls.
+        WM_ACTIVATE => {
+            if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                let focus = GetFocus();
+                if !focus.is_invalid() && IsChild(hwnd, focus).as_bool() {
+                    LAST_FOCUS.with(|f| f.set(focus.0 as isize));
+                }
+            } else {
+                let last = HWND(LAST_FOCUS.with(|f| f.get()) as *mut c_void);
+                if !last.is_invalid() && IsChild(hwnd, last).as_bool() {
+                    let _ = SetFocus(Some(last));
+                }
+            }
+            LRESULT(0)
+        }
+        WM_ENTERSIZEMOVE => {
+            MOVING.with(|m| m.set(true));
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            if MOVING.with(|m| m.get()) {
+                DPI_PENDING.with(|p| p.set(true));
+            } else {
+                let _ = PostMessageW(Some(hwnd), WM_APP_REOPEN, WPARAM(current_tab(hwnd)), LPARAM(0));
+            }
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            MOVING.with(|m| m.set(false));
+            if DPI_PENDING.with(|p| p.replace(false)) {
+                let _ = PostMessageW(Some(hwnd), WM_APP_REOPEN, WPARAM(current_tab(hwnd)), LPARAM(0));
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             SETTINGS_HWND.store(0, Ordering::Relaxed);
             PAGES.with(|p| p.borrow_mut().clear());
+            MOVING.with(|m| m.set(false));
+            DPI_PENDING.with(|p| p.set(false));
+            LAST_FOCUS.with(|f| f.set(0));
             LRESULT(0)
+        }
+        // After the controls are gone, the fonts they used can go too.
+        WM_NCDESTROY => {
+            for raw in FONT_HANDLES.with(|f| std::mem::take(&mut *f.borrow_mut())) {
+                let _ = DeleteObject(HFONT(raw as *mut c_void).into());
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }

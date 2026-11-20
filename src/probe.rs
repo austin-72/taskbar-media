@@ -6,6 +6,7 @@
 //! nothing recognisable is found (Windows 10, or a future taskbar redesign)
 //! the result is simply empty and the widget falls back to its defaults.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -30,6 +31,11 @@ pub struct Probe {
 
 static RESULTS: Mutex<Vec<(isize, Probe)>> = Mutex::new(Vec::new());
 
+/// Set by the widget: measuring is only worth its cost (it walks the whole
+/// taskbar in another process) while a widget is on screen and is meant to
+/// keep clear of the app buttons.
+pub static WANTED: AtomicBool = AtomicBool::new(false);
+
 /// The latest measurements for a taskbar window.
 pub fn get(taskbar: HWND) -> Probe {
     let key = taskbar.0 as isize;
@@ -48,6 +54,10 @@ pub fn spawn() {
             return;
         };
         loop {
+            if !WANTED.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
             let mut results = Vec::new();
             for hwnd in taskbars() {
                 results.push((hwnd.0 as isize, measure(&uia, hwnd).unwrap_or_default()));

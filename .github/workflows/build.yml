@@ -1,6 +1,11 @@
-# Builds TaskbarMedia.exe on every push, and attaches it to a release when one
-# is published on GitHub. Can also be run by hand from the Actions tab to
-# rebuild a release's exe: enter the release tag when asked.
+# Tests and builds TaskbarMedia.exe on every push and pull request, and
+# attaches the exe (with its SHA-256 checksum) to a release when one is
+# published on GitHub. Can also be run by hand from the Actions tab to rebuild
+# a release's exe: enter the release tag when asked (releases from 1.0.0 on,
+# which have a Cargo.lock).
+#
+# Only GitHub's own actions are used, so that nothing third-party runs in the
+# job that produces the exe people download.
 name: Build
 
 on:
@@ -16,28 +21,95 @@ on:
         required: false
         default: ""
 
+# Read-only by default. Only the job that uploads to a release may write,
+# and it never runs code from the repository.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: build-${{ github.event.release.tag_name || inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Passed through the environment rather than pasted into commands.
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
+      # A release whose tag does not match Cargo.toml would produce an exe
+      # that reports the old version and offers itself as an update for ever.
+      - name: Check that the release tag matches the version in Cargo.toml
+        if: env.RELEASE_TAG != ''
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json).packages[0].version
+          if ($env:RELEASE_TAG -ne "v$version" -and $env:RELEASE_TAG -ne $version) {
+            Write-Error "Release tag '$env:RELEASE_TAG' does not match version $version in Cargo.toml."
+            exit 1
+          }
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Lint (reported only)
+        run: cargo clippy --locked
+        continue-on-error: true
+
+      # Debug symbols go into a separate file (TaskbarMedia.pdb), kept with
+      # the run, so that an address from a user's crash log can be turned
+      # into a source line. They do not change how the exe runs.
       - name: Build
         run: cargo build --release --locked
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+          CARGO_PROFILE_RELEASE_STRIP: none
+
+      - name: Write the SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash target/release/TaskbarMedia.exe -Algorithm SHA256).Hash.ToLower()
+          # The usual "hash  name" line with a plain line ending, so that
+          # sha256sum -c accepts it too.
+          [IO.File]::WriteAllText("$PWD/target/release/TaskbarMedia.exe.sha256", "$hash  TaskbarMedia.exe`n")
+          Write-Host "SHA-256: $hash"
 
       - name: Keep the exe as a build artifact
         uses: actions/upload-artifact@v4
         with:
           name: TaskbarMedia
-          path: target/release/TaskbarMedia.exe
+          path: |
+            target/release/TaskbarMedia.exe
+            target/release/TaskbarMedia.exe.sha256
 
-      - name: Attach the exe to the release
-        if: github.event_name == 'release' || inputs.tag != ''
-        run: gh release upload "${{ github.event.release.tag_name || inputs.tag }}" target/release/TaskbarMedia.exe --clobber
+      - name: Keep the debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: TaskbarMedia-symbols
+          path: target/release/TaskbarMedia.pdb
+          if-no-files-found: warn
+
+  release:
+    name: Attach the exe to the release
+    needs: build
+    if: github.event_name == 'release' || inputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TaskbarMedia
+
+      - name: Upload
+        run: gh release upload "$RELEASE_TAG" TaskbarMedia.exe TaskbarMedia.exe.sha256 --clobber --repo "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}

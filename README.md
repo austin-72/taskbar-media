@@ -37,9 +37,39 @@ playing and when a full-screen app is in front. Titles that are too long to
 fit scroll. The widget keeps clear of app icons: on Windows 10 the taskbar's
 app area is narrowed to make room for it, and on Windows 11 the widget shrinks.
 
-## Use
+## Install
 
-Run `TaskbarMedia.exe`. There is no installer and no other files.
+1. Download `TaskbarMedia.exe` from the
+   [latest release](https://github.com/austin-72/taskbar-media/releases/latest)
+   and put it somewhere it can stay, for example a `TaskbarMedia` folder in
+   Documents.
+2. Run it. There is no installer and there are no other files.
+3. The exe is not code-signed, so the first time Windows may show "Windows
+   protected your PC". Choose **More info**, then **Run anyway**.
+
+To check a download, compare its SHA-256 with the one in the
+`TaskbarMedia.exe.sha256` file attached to the same release. In PowerShell,
+in the folder with both files, this prints `True` when they match:
+
+    (Get-FileHash TaskbarMedia.exe).Hash -eq (Get-Content TaskbarMedia.exe.sha256).Split()[0]
+
+**Updating:** right-click the widget and choose Exit, replace the exe with
+the new one, and run it. Your settings are kept. If you put the new exe
+somewhere else instead, un-tick and re-tick "Start with Windows" in Settings
+so that Windows starts the new copy (Settings says when another copy is the
+one set to start; if the old copy is deleted, the setting moves over by
+itself).
+
+**Removing:** turn off "Start with Windows" in Settings, exit, and delete the
+exe. To remove every trace, also delete the registry key
+`HKCU\Software\TaskbarMedia` and the folder `%LOCALAPPDATA%\TaskbarMedia`.
+
+Task Manager shows two TaskbarMedia processes. That is intended: a tiny one
+watches the widget and starts it again if it ever crashes or stops
+responding. Starting the exe a second time opens the settings window of the
+copy that is already running.
+
+## Use
 
 - Right-click the widget or use the tray icon for settings (a settings
   button can be added to the widget in Settings, Layout)
@@ -54,6 +84,8 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 - Right-click and choose Output device to switch speakers / headphones, or
   add the output button to the widget in Settings, Layout
 - Shift + mouse wheel over a widget nudges it left or right
+- With a popup open: Up / Down move through it, Enter chooses, Esc closes;
+  in the mixer Left / Right change the volume and Space or M mutes
 
 ## Settings
 
@@ -62,29 +94,57 @@ Run `TaskbarMedia.exe`. There is no installer and no other files.
 - **General**: start with Windows, hide while paused, tray icon, update
   check, Spotify only, which taskbars to show on, keep clear of app icons
 - **Layout**: which items show and in what order (with the title and seek
-  bar stacked, side by side, or on their own), a separate layout for other
-  displays, text width, button size and spacing, shuffle stacked above
-  repeat, what the text shows, and whether unusable buttons are greyed out
-  or hidden
-- **Appearance**: text size, font, text color, rendering (smooth or sharp),
-  highlight color, custom colors, album art shape, seek bar thickness,
-  background, times, scrolling titles, hover card
+  bar stacked, side by side, or on their own), presets, a separate layout
+  for other displays, button size and spacing, shuffle stacked above repeat,
+  and whether unusable buttons are greyed out or hidden
+- **Appearance**: text size, text width, what the text shows, font, text
+  color, rendering (smooth or sharp), highlight color, custom colors, album
+  art shape, seek bar thickness, background, times, scrolling titles, hover
+  card
 - **Behavior**: what the mouse wheel, a click on the album art, a click on
   the title, and the output device button do, and which volume the speaker
   icon reflects
 - **More**: export, import or reset all settings; version and releases;
-  the crash log folder
+  the crash log folder; "Save pictures of the widget", which writes PNG
+  images of the widget and its popups to a `pictures` folder beside the exe
 
 A live preview at the top of the settings window shows the result as you go,
 the layout list can be reordered by dragging, and presets (Default, Minimal,
-Compact, Everything, Classic) give a starting point.
+Compact, Everything, Classic) give a starting point. Ctrl+Tab moves between
+the tabs and Esc closes the window.
 
-If the widget ever crashes it restarts itself and writes a line to
-`%LOCALAPPDATA%\TaskbarMedia\crash.log`.
+If the widget ever crashes or stops responding it is restarted, and a line
+is written to `%LOCALAPPDATA%\TaskbarMedia\crash.log`.
 
 Requires Windows 10 (1809 or later) or Windows 11, 64-bit, with the taskbar at
 the bottom or top of the screen. Taskbars on other displays exist only when
 "Show my taskbar on all displays" is on in Windows taskbar settings.
+
+## Known limits
+
+- A taskbar at the left or right edge of the screen is not supported; the
+  widget stays hidden there.
+- Keeping clear of app icons works on the main taskbar of Windows 10 and on
+  Windows 11. On Windows 10's taskbars on *other* displays, and with tools
+  that replace the Windows 11 taskbar with the old one (ExplorerPatcher,
+  StartAllBack), the widget can cover the last app buttons when the taskbar
+  is full; nudge it with Shift + mouse wheel or pick a narrower layout.
+- Two tabs or windows of the same browser are one player to Windows' own
+  media controls, and so to the widget.
+- The mouse wheel changes the player's own volume when Windows lists that
+  player in its volume mixer on the current output device; otherwise it
+  changes the system volume (Windows then shows its own volume display).
+- The mixer and the device list show as many rows as fit on the screen and
+  say how many more there are.
+- A player picked by hand is followed until it closes; the choice is not
+  remembered across restarts.
+- With several other displays, all of their widgets share one sideways
+  nudge. "Show on one display" identifies the display by its Windows
+  number, which can change when displays are re-plugged.
+- Changing the output device does not change the separate "communications"
+  device that call apps use.
+- Right-to-left Windows layouts are untested.
+- Windows 11 support has had less testing than Windows 10.
 
 ## Switching output devices
 
@@ -98,15 +158,19 @@ shows "Could not switch output" and everything else keeps working.
 Unless turned off in settings, the app asks GitHub's public API a few times a
 day for this repository's latest release number. Nothing else is sent, and
 nothing is downloaded or installed: a newer version only adds a dot on the
-gear and a menu entry that opens the releases page.
+widget and a menu entry that opens the releases page.
 
 ## Build
 
     cargo build --release
+    cargo test
 
-Building on Windows needs the MSVC toolchain and Windows SDK (for `rc.exe`).
-Each push is also built by GitHub Actions, and publishing a release on GitHub
-attaches a freshly built `TaskbarMedia.exe` to it.
+Building on Windows needs Rust 1.85 or later and Visual Studio Build Tools
+with the "Desktop development with C++" workload (the MSVC linker and the
+Windows SDK, for `rc.exe`). Each push is also tested and built by GitHub
+Actions, and publishing a release on GitHub attaches a freshly built
+`TaskbarMedia.exe` and its SHA-256 checksum to it. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for more.
 
 Settings live in `HKCU\Software\TaskbarMedia`; "Start with Windows" adds a
 value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.

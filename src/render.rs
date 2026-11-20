@@ -44,6 +44,10 @@ impl Rect {
     fn f(&self) -> RectF {
         RectF { X: self.x, Y: self.y, Width: self.w, Height: self.h }
     }
+    /// The same rectangle in a picture `k` times larger.
+    fn times(&self, k: f32) -> Rect {
+        Rect { x: self.x * k, y: self.y * k, w: self.w * k, h: self.h * k }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -99,12 +103,6 @@ pub struct LayoutParams {
     pub stack: bool,
 }
 
-impl LayoutParams {
-    fn scaled(&self, k: i32) -> Self {
-        LayoutParams { height: self.height * k, scale: self.scale * k as f32, ..*self }
-    }
-}
-
 /// Where everything sits, in pixels relative to the widget. From the left:
 /// settings gear, album art, shuffle, transport buttons, repeat, then title
 /// over the seek bar.
@@ -142,11 +140,47 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// The layout as it is in a picture `k` times larger. Drawing is done
+    /// on such a picture and averaged down; scaling the finished layout
+    /// (rather than laying out afresh at the larger size) keeps every edge
+    /// on a real pixel and exactly where clicks are tested.
+    pub fn scaled(&self, k: i32) -> Layout {
+        let k = k as f32;
+        Layout {
+            width: self.width * k,
+            u: self.u * k,
+            t: self.t,
+            b: self.b,
+            gear: self.gear.times(k),
+            art: self.art.times(k),
+            buttons: self.buttons.map(|r| r.times(k)),
+            extras: self.extras.map(|r| r.times(k)),
+            output: self.output.times(k),
+            players: self.players.times(k),
+            vol_icon: self.vol_icon.times(k),
+            stacked: self.stacked,
+            stacked_extras: self.stacked_extras,
+            row1: self.row1.times(k),
+            row2: self.row2.times(k),
+            elapsed: self.elapsed.times(k),
+            total: self.total.times(k),
+            track: self.track.times(k),
+            seek_hit: self.seek_hit.times(k),
+        }
+    }
+
     pub fn new(p: &LayoutParams) -> Self {
         let h = p.height as f32;
         let u = p.scale.min(h / 40.0).max(0.5);
         let t = [0.92, 1.0, 1.15][p.text_size.min(2) as usize];
-        let text_w = [140.0, 190.0, 260.0][p.width.min(2) as usize];
+        // On a short taskbar (Windows 10's "small taskbar buttons") the
+        // buttons have to shrink with it, but text that shrank as much would
+        // be too small to read; let it keep more of its size, as far as the
+        // two rows still fit.
+        let t = (t * (p.scale.min(h / 34.0).max(0.5) / u)).min(((h - 2.0) / (31.0 * u)).max(0.6));
+        // Larger text gets a little more room, smaller text a little less.
+        let text_w = [140.0, 190.0, 260.0][p.width.min(2) as usize]
+            * [0.95, 1.0, 1.08][p.text_size.min(2) as usize];
 
         let bs = [0.85, 1.0, 1.18][p.button_size.min(2) as usize];
 
@@ -164,7 +198,7 @@ impl Layout {
         let mut l = Layout { u, t, b: bs, ..Default::default() };
 
         // Walk the items left to right, giving each its place.
-        let items: Vec<u8> = p
+        let mut items: Vec<u8> = p
             .order
             .iter()
             .copied()
@@ -178,14 +212,26 @@ impl Layout {
                 _ => true,
             })
             .collect();
+        // Never an empty (invisible, unclickable) widget: when everything
+        // chosen is unavailable right now, the album art stands in.
+        if items.is_empty() {
+            items.push(ITEM_ART);
+        }
         let mut x = match items.first() {
             Some(&ITEM_GEAR) | Some(&ITEM_PLAYERS) => (3.0 * u).round(),
             _ => (6.0 * u).round(),
         };
         let stack = p.stack && items.contains(&ITEM_SHUFFLE) && items.contains(&ITEM_REPEAT);
         let mut end_pad = 0.0;
+        // Text ends exactly at the edge of its block; the items that have
+        // no margin of their own need some air after it.
+        let mut after_text = false;
         for item in items {
             end_pad = 0.0;
+            if after_text && matches!(item, ITEM_GEAR | ITEM_PLAYERS | ITEM_ART) {
+                x += (8.0 * u).round();
+            }
+            after_text = matches!(item, ITEM_INFO | ITEM_TITLE | ITEM_SEEK);
             match item {
                 // Small, level with the top of the art.
                 ITEM_GEAR => {
@@ -265,12 +311,13 @@ impl Layout {
         if seek {
             let y = if stacked { ty + row1_h + gap } else { ((h - row2_h) / 2.0).floor() };
             let row2 = Rect { x: tx, y, w: tw, h: row2_h };
+            // Whole pixels, so the bar's ends are sharp.
             let label_w = if p.show_times {
-                (p.time_chars.max(4) as f32 * 5.6 + 3.0) * u * t
+                ((p.time_chars.max(4) as f32 * 5.6 + 3.0) * u * t).round()
             } else {
                 0.0
             };
-            let label_gap = if p.show_times { 6.0 * u } else { 2.0 * u };
+            let label_gap = (if p.show_times { 6.0 * u } else { 2.0 * u }).round();
             let total = Rect { x: tx + tw - label_w, w: label_w, ..row2 };
             let track_h = ([2.0, 3.0, 5.0][p.seek_size.min(2) as usize] * u).round().max(2.0);
             let track_x = tx + label_w + label_gap;
@@ -286,8 +333,13 @@ impl Layout {
             self.track = track;
             // Stacked: from just above the bar down to the screen edge. On
             // its own: the full height of the taskbar.
+            // A little wider than the bar, so that its very ends are easy
+            // to reach, but never wider than the text block: the items on
+            // either side keep every one of their pixels.
             let top = if stacked { row2.y - 3.0 * u } else { 0.0 };
-            self.seek_hit = Rect { x: track.x - 5.0 * u, y: top, w: track.w + 10.0 * u, h: h - top };
+            let left = (track.x - 5.0 * u).max(tx);
+            let right = (track.x + track.w + 5.0 * u).min(tx + tw);
+            self.seek_hit = Rect { x: left, y: top, w: right - left, h: h - top };
         }
         tx + tw
     }
@@ -297,19 +349,9 @@ impl Layout {
             return Hit::Seek;
         }
         let within = |r: &Rect, pad: f32| r.w > 0.0 && x >= r.x - pad && x < r.x + r.w + pad;
-        // Generous target around the little gear.
-        if within(&self.gear, 3.0 * self.u) {
-            return if y < self.gear.y + self.gear.h + 4.0 * self.u { Hit::Gear } else { Hit::None };
-        }
-        // The switcher: top half is up, bottom half is down.
-        if within(&self.players, 2.0 * self.u) {
-            let middle = self.players.y + self.players.h / 2.0;
-            return if y < middle { Hit::PlayerUp } else { Hit::PlayerDown };
-        }
-        // Art and buttons can be clicked over the full height of the taskbar.
-        if within(&self.art, 2.0 * self.u) {
-            return Hit::Art;
-        }
+        // Buttons first, by their exact columns (they can be clicked over
+        // the full height of the taskbar), so that the generous margins of
+        // the small items below never take pixels from a neighbour.
         for (i, b) in self.buttons.iter().enumerate() {
             if within(b, 0.0) {
                 return [Hit::Prev, Hit::Play, Hit::Next][i];
@@ -333,7 +375,25 @@ impl Layout {
         if within(&self.vol_icon, 0.0) {
             return Hit::VolIcon;
         }
-        if within(&self.row1, 0.0) && (!self.stacked || y < self.row2.y - 3.0 * self.u) {
+        // Art, exactly; then the little gear and the switcher with some
+        // margin; then the art's own margin.
+        if within(&self.art, 0.0) {
+            return Hit::Art;
+        }
+        if within(&self.gear, 3.0 * self.u) {
+            return if y < self.gear.y + self.gear.h + 4.0 * self.u { Hit::Gear } else { Hit::None };
+        }
+        // The switcher: top half is up, bottom half is down.
+        if within(&self.players, 2.0 * self.u) {
+            let middle = self.players.y + self.players.h / 2.0;
+            return if y < middle { Hit::PlayerUp } else { Hit::PlayerDown };
+        }
+        if within(&self.art, 2.0 * self.u) {
+            return Hit::Art;
+        }
+        // The title: its row, or with no seek bar below it the whole column
+        // (the title is then drawn in the middle of the taskbar).
+        if within(&self.row1, 0.0) && (!self.stacked || !has_timeline || y < self.row2.y - 3.0 * self.u) {
             return Hit::Title;
         }
         Hit::None
@@ -379,7 +439,9 @@ pub struct Frame {
     pub dragging: bool,
     /// Scroll a too-long title instead of ending it with "...".
     pub scroll: bool,
-    /// How far the title is currently scrolled, in pixels.
+    /// How far the title is currently scrolled, in steps of the picture it
+    /// is drawn on: pixels times `supersample_factor` (so that slow scrolling
+    /// moves by fractions of a pixel instead of jerking).
     pub scroll_px: i32,
     pub can_shuffle: bool,
     pub shuffle: bool,
@@ -399,6 +461,9 @@ pub struct Frame {
     pub volume: Option<u8>,
     /// Short message to show briefly in place of the title.
     pub notice: Option<String>,
+    /// The color of the taskbar behind the widget (0xRRGGBB, an estimate),
+    /// which the highlight color must stand out from.
+    pub bar: u32,
     /// Mark the settings gear: a newer version is available.
     pub update: bool,
     /// The current output is headphones (changes the output button's icon).
@@ -449,6 +514,10 @@ pub fn init() {
 
 /// Supersampling factor for smooth drawing: more on low-DPI screens, where
 /// it matters most.
+pub fn supersample_factor(smooth: bool, scale: f32) -> i32 {
+    supersample(smooth, scale)
+}
+
 fn supersample(smooth: bool, scale: f32) -> i32 {
     if !smooth {
         1
@@ -469,6 +538,7 @@ unsafe fn render_pixels<R: Default>(
     draw: impl FnOnce(*mut GpGraphics) -> R,
 ) -> Option<(Vec<u32>, R)> {
     let (bw, bh) = (w * k, h * k);
+    FONT_FLOOR.with(|f| f.set(6.0 * k as f32));
     let mut big = vec![0u32; (bw * bh) as usize];
     let mut bitmap: *mut GpBitmap = null_mut();
     GdipCreateBitmapFromScan0(
@@ -528,6 +598,7 @@ unsafe fn render_to_window<R: Default>(
             let old = SelectObject(mem, dib.into());
             let size = SIZE { cx: w, cy: h };
             let origin = POINT::default();
+            let place = NEXT_PLACE.with(|p| p.get()).map(|(x, y)| POINT { x, y });
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
@@ -537,7 +608,7 @@ unsafe fn render_to_window<R: Default>(
             let _ = UpdateLayeredWindow(
                 hwnd,
                 Some(screen),
-                None,
+                place.as_ref().map(|p| p as *const POINT),
                 Some(&size),
                 Some(mem),
                 Some(&origin),
@@ -562,7 +633,7 @@ pub fn render_preview(f: &Frame, art: Option<&[u8]>, spotify: bool, background: 
         return Vec::new();
     }
     let k = supersample(f.smooth, f.params.scale);
-    let layout = Layout::new(&f.params.scaled(k));
+    let layout = Layout::new(&f.params).scaled(k);
     let mut cache = None;
     let pixels = unsafe { render_pixels(f.w, f.h, k, |g| draw(g, f, &layout, k, &mut cache, art, spotify)) };
     let Some((mut pixels, _)) = pixels else { return Vec::new() };
@@ -592,7 +663,7 @@ pub fn paint(
         return 0.0;
     }
     let k = supersample(f.smooth, f.params.scale);
-    let layout = Layout::new(&f.params.scaled(k));
+    let layout = Layout::new(&f.params).scaled(k);
     unsafe {
         render_to_window(hwnd, f.w, f.h, k, |g| draw(g, f, &layout, k, cache, art, spotify)) / k as f32
     }
@@ -655,6 +726,8 @@ pub struct Mixer {
     pub accent: u32,
     /// Row 0 is the system volume.
     pub rows: Vec<MixerRow>,
+    /// How many more apps there are than there was room to list.
+    pub more: usize,
     /// Row under the mouse (-1 for none), and whether it is on the icon.
     pub hover_row: i32,
     pub hover_icon: bool,
@@ -677,10 +750,41 @@ pub struct MixerLayout {
     pub w: i32,
     pub h: i32,
     pub rows: Vec<MixerRowRects>,
+    /// The line saying how many rows were left out; zero-sized if none.
+    pub footer: Rect,
 }
 
-/// Lay out the mixer popup for `n` rows at a DPI scale.
-pub fn mixer_layout(scale: f32, n: usize) -> MixerLayout {
+/// Height of the "and N more" line of a popup, at a DPI scale.
+fn footer_height(scale: f32) -> f32 {
+    (22.0 * scale).round()
+}
+
+impl MixerLayout {
+    /// The same layout in a picture `k` times larger.
+    fn times(&self, k: i32) -> MixerLayout {
+        let kf = k as f32;
+        MixerLayout {
+            w: self.w * k,
+            h: self.h * k,
+            rows: self
+                .rows
+                .iter()
+                .map(|r| MixerRowRects {
+                    row: r.row.times(kf),
+                    icon: r.icon.times(kf),
+                    name: r.name.times(kf),
+                    track: r.track.times(kf),
+                    percent: r.percent.times(kf),
+                })
+                .collect(),
+            footer: self.footer.times(kf),
+        }
+    }
+}
+
+/// Lay out the mixer popup for `n` rows at a DPI scale, with a line at the
+/// bottom for "and N more" if `footer`.
+pub fn mixer_layout(scale: f32, n: usize, footer: bool) -> MixerLayout {
     let u = scale;
     let pad = (10.0 * u).round();
     let row_h = (34.0 * u).round();
@@ -704,18 +808,23 @@ pub fn mixer_layout(scale: f32, n: usize) -> MixerLayout {
         };
         rows.push(MixerRowRects { row, icon, name, track, percent });
     }
-    let h = pad * 2.0 + n as f32 * row_h + divider;
-    MixerLayout { w: w as i32, h: h as i32, rows }
+    let rows_end = pad + n as f32 * row_h + divider;
+    let footer_h = if footer { footer_height(u) } else { 0.0 };
+    let h = rows_end + footer_h + pad;
+    let footer = Rect { x: pad, y: rows_end, w: w - 2.0 * pad, h: footer_h };
+    MixerLayout { w: w as i32, h: h as i32, rows, footer }
 }
 
 /// Draw the mixer popup into its layered window.
 pub fn paint_mixer(hwnd: HWND, m: &Mixer) {
     let k = supersample(m.smooth, m.scale);
-    let layout = mixer_layout(m.scale, m.rows.len());
+    let layout = mixer_layout(m.scale, m.rows.len(), m.more > 0);
     if layout.w <= 0 || layout.h <= 0 {
         return;
     }
-    let big = mixer_layout(m.scale * k as f32, m.rows.len());
+    // The same rectangles clicks are tested against, enlarged; laying out
+    // afresh at the larger size would round each row differently.
+    let big = layout.times(k);
     unsafe {
         render_to_window(hwnd, layout.w, layout.h, k, |g| draw_mixer(g, m, &big, k));
     }
@@ -783,6 +892,16 @@ unsafe fn draw_mixer(g: *mut GpGraphics, m: &Mixer, l: &MixerLayout, k: i32) {
             GdipDeleteBrush(brush);
         }
     }
+    if m.more > 0 && l.footer.h > 0.0 {
+        let middle = make_format(StringAlignmentCenter, true);
+        let text = if m.more == 1 {
+            "and 1 more app (see the Windows volume mixer)".to_string()
+        } else {
+            format!("and {} more apps (see the Windows volume mixer)", m.more)
+        };
+        draw_text(g, &text, small, l.footer, middle, dim);
+        GdipDeleteStringFormat(middle);
+    }
     GdipDeleteFont(bold);
     GdipDeleteFont(regular);
     GdipDeleteFont(small);
@@ -809,13 +928,13 @@ pub fn snapshot(shot: Shot) -> Option<(Vec<u32>, i32, i32)> {
             }
             Shot::Mixer(m) => {
                 let k = supersample(m.smooth, m.scale);
-                let layout = mixer_layout(m.scale, m.rows.len());
-                let big = mixer_layout(m.scale * k as f32, m.rows.len());
+                let layout = mixer_layout(m.scale, m.rows.len(), m.more > 0);
+                let big = layout.times(k);
                 render_pixels(layout.w, layout.h, k, |g| draw_mixer(g, m, &big, k)).map(|(p, _)| (p, layout.w, layout.h))
             }
             Shot::Picker(p) => {
                 let k = supersample(p.smooth, p.scale);
-                let (w, h, _) = picker_layout(p.scale, p.rows.len());
+                let (w, h, _) = picker_layout(p.scale, p.rows.len(), p.more > 0);
                 render_pixels(w, h, k, |g| draw_picker(g, p, k)).map(|(px, _)| (px, w, h))
             }
             Shot::Menu(m) => {
@@ -937,8 +1056,9 @@ pub fn paint_menu(hwnd: HWND, m: &MenuPanel) {
 
 unsafe fn draw_menu(g: *mut GpGraphics, m: &MenuPanel, kinds: &[u8], k: i32) {
     let u = m.scale * k as f32;
-    let (w, h, rows) = menu_layout(u, kinds);
-    let (w, h) = (w as f32, h as f32);
+    let (w, h, rows) = menu_layout(m.scale, kinds);
+    let rows: Vec<Rect> = rows.iter().map(|r| r.times(k as f32)).collect();
+    let (w, h) = ((w * k) as f32, (h * k) as f32);
     let fg: u32 = if m.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
     let dim = alpha(fg, 0x9E);
     let accent = if m.accent != 0 { m.accent | 0xFF00_0000 } else { fg };
@@ -1024,12 +1144,15 @@ pub struct Picker {
     /// color.
     pub accent: u32,
     pub rows: Vec<PickerRow>,
+    /// How many more devices there are than there was room to list.
+    pub more: usize,
     /// Row under the mouse, or -1.
     pub hover_row: i32,
 }
 
-/// Size of the output device popup and the rectangle of each row.
-pub fn picker_layout(scale: f32, n: usize) -> (i32, i32, Vec<Rect>) {
+/// Size of the output device popup and the rectangle of each row, with room
+/// at the bottom for an "and N more" line if `footer`.
+pub fn picker_layout(scale: f32, n: usize, footer: bool) -> (i32, i32, Vec<Rect>) {
     let u = scale;
     let pad = (8.0 * u).round();
     let row_h = (36.0 * u).round();
@@ -1037,13 +1160,14 @@ pub fn picker_layout(scale: f32, n: usize) -> (i32, i32, Vec<Rect>) {
     let rows = (0..n)
         .map(|i| Rect { x: pad, y: pad + i as f32 * row_h, w: w - 2.0 * pad, h: row_h })
         .collect();
-    (w as i32, (pad * 2.0 + n as f32 * row_h) as i32, rows)
+    let footer_h = if footer { footer_height(u) } else { 0.0 };
+    (w as i32, (pad * 2.0 + n as f32 * row_h + footer_h) as i32, rows)
 }
 
 /// Draw the output device popup into its layered window.
 pub fn paint_picker(hwnd: HWND, p: &Picker) {
     let k = supersample(p.smooth, p.scale);
-    let (w, h, _) = picker_layout(p.scale, p.rows.len());
+    let (w, h, _) = picker_layout(p.scale, p.rows.len(), p.more > 0);
     if w <= 0 || h <= 0 {
         return;
     }
@@ -1054,8 +1178,9 @@ pub fn paint_picker(hwnd: HWND, p: &Picker) {
 
 unsafe fn draw_picker(g: *mut GpGraphics, p: &Picker, k: i32) {
     let u = p.scale * k as f32;
-    let (w, h, rows) = picker_layout(u, p.rows.len());
-    let (w, h) = (w as f32, h as f32);
+    let (w, h, rows) = picker_layout(p.scale, p.rows.len(), p.more > 0);
+    let rows: Vec<Rect> = rows.iter().map(|r| r.times(k as f32)).collect();
+    let (w, h) = ((w * k) as f32, (h * k) as f32);
     let fg: u32 = if p.light { 0xFF00_0000 } else { 0xFFFF_FFFF };
     let dim = alpha(fg, 0x9E);
     let accent = if p.accent != 0 { p.accent | 0xFF00_0000 } else { fg };
@@ -1101,6 +1226,21 @@ unsafe fn draw_picker(g: *mut GpGraphics, p: &Picker, k: i32) {
                 GdipDrawLine(g, tick, cx - 1.5 * u, cy + 3.5 * u, cx + 5.0 * u, cy - 3.5 * u);
                 GdipDeletePen(tick);
             }
+        }
+    }
+    if p.more > 0 {
+        if let Some(last) = rows.last() {
+            let footer = Rect { x: last.x, y: last.y + last.h, w: last.w, h: footer_height(u) };
+            let middle = make_format(StringAlignmentCenter, true);
+            let small = make_font(family, 11.0 * u, false);
+            let text = if p.more == 1 {
+                "and 1 more device (see Windows sound settings)".to_string()
+            } else {
+                format!("and {} more devices (see Windows sound settings)", p.more)
+            };
+            draw_text(g, &text, small, footer, middle, dim);
+            GdipDeleteFont(small);
+            GdipDeleteStringFormat(middle);
         }
     }
     GdipDeleteFont(bold);
@@ -1224,6 +1364,8 @@ unsafe fn draw(
     let disabled = alpha(fg, 0x48);
     let plate = alpha(fg, if f.light { 0x12 } else { 0x1C });
     let plate_down = alpha(fg, if f.light { 0x0A } else { 0x10 });
+    // Behind a button whose popup is open: stronger than a mere hover.
+    let plate_open = alpha(fg, if f.light { 0x1E } else { 0x2C });
 
     GdipGraphicsClear(g, 0x0000_0000);
     GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
@@ -1245,11 +1387,14 @@ unsafe fn draw(
             (_, true) => 0xE6F3_F3F3,
             (_, false) => 0xE61C_1C1C,
         };
-        let inset = 3.0 * u;
+        // On whole real pixels, so its edges are crisp at every scaling.
+        let kf = k as f32;
+        let inset = (3.0 * u / kf).round() * kf;
+        let side = (1.0 * u / kf).round().max(1.0) * kf;
         let r = Rect {
-            x: 1.0 * u,
+            x: side,
             y: inset,
-            w: (f.w * k) as f32 - 2.0 * u,
+            w: (f.w * k) as f32 - 2.0 * side,
             h: (f.h * k) as f32 - 2.0 * inset,
         };
         fill_round_color(g, color, r, 7.0 * u);
@@ -1393,11 +1538,13 @@ unsafe fn draw(
         GdipDeleteBrush(brush);
     }
 
+    // Whatever its source, the highlight has to stand out from the taskbar.
     let accent = match f.accent {
-        0 if f.has_art => cache.as_ref().and_then(|c| c.accent).map(|hs| accent_color(hs, f.light)),
+        0 if f.has_art => cache.as_ref().and_then(|c| c.accent).map(|hs| accent_color(hs, luminance(f.bar) > 0.4)),
         1 => Some(f.accent_rgb),
         _ => None,
-    };
+    }
+    .map(|color| readable(color, f.bar));
 
     // ---- shuffle and repeat ------------------------------------------------
     {
@@ -1423,7 +1570,8 @@ unsafe fn draw(
             } else {
                 dim
             };
-            let (cx, cy) = (b.cx(), b.cy() - if l.stacked_extras { 0.0 } else { 1.0 * u });
+            // Stacked, the icon moves left a little to leave room for its dot.
+            let (cx, cy) = if l.stacked_extras { (b.cx() - 1.6 * u, b.cy()) } else { (b.cx(), b.cy() - 1.0 * u) };
             let mut pen: *mut GpPen = null_mut();
             GdipCreatePen1(color, 1.5 * u, UnitPixel, &mut pen);
             let brush = solid(color);
@@ -1441,11 +1589,15 @@ unsafe fn draw(
                     // A loop with an arrowhead; "1" inside when repeating one track.
                     let r = Rect { x: cx - 6.0 * u, y: cy - 3.6 * u, w: 12.0 * u, h: 7.2 * u };
                     stroke_round(g, pen, r, 3.2 * u);
-                    polygon(g, brush, &[(cx - 0.4 * u, r.y - 2.6 * u), (cx - 0.4 * u, r.y + 2.6 * u), (cx + 2.8 * u, r.y)]);
-                    if f.repeat == 1 {
-                        let font = make_font("Segoe UI", 7.5 * u, true);
+                    // Repeating one track: the arrowhead moves aside to
+                    // leave the middle of the loop to the "1".
+                    let one = f.repeat == 1;
+                    let ax = if one { cx + 1.6 * u } else { cx - 0.4 * u };
+                    polygon(g, brush, &[(ax, r.y - 2.6 * u), (ax, r.y + 2.6 * u), (ax + 3.2 * u, r.y)]);
+                    if one && !l.stacked_extras {
+                        let font = make_font("Segoe UI", 6.6 * u, true);
                         let fmt = make_format(StringAlignmentCenter, false);
-                        let box1 = Rect { x: cx - 5.0 * u, y: cy - 4.4 * u, w: 10.0 * u, h: 9.0 * u };
+                        let box1 = Rect { x: cx - 6.0 * u, y: cy - 3.8 * u, w: 9.0 * u, h: 8.4 * u };
                         draw_text(g, "1", font, box1, fmt, color);
                         GdipDeleteFont(font);
                         GdipDeleteStringFormat(fmt);
@@ -1453,9 +1605,24 @@ unsafe fn draw(
                 }
                 GdipDeletePen(pen);
             }
-            if enabled[i] && active[i] && !l.stacked_extras {
+            // The "on" dot: underneath, or beside the icon when stacked (so
+            // that on and off differ by more than brightness there too).
+            if enabled[i] && active[i] {
                 let d = 1.3 * u;
-                GdipFillEllipse(g, brush, cx - d, cy + 7.2 * u, d * 2.0, d * 2.0);
+                if l.stacked_extras && i == 1 && f.repeat == 1 {
+                    // Stacked, the loop is too small to hold a legible "1";
+                    // it takes the dot's place beside the icon instead.
+                    let font = make_font("Segoe UI", 8.0 * u, true);
+                    let fmt = make_format(StringAlignmentCenter, false);
+                    let box1 = Rect { x: cx + 5.4 * u, y: cy - 6.0 * u, w: 8.0 * u, h: 12.0 * u };
+                    draw_text(g, "1", font, box1, fmt, color);
+                    GdipDeleteFont(font);
+                    GdipDeleteStringFormat(fmt);
+                } else if l.stacked_extras {
+                    GdipFillEllipse(g, brush, cx + 9.4 * u - d, cy - d, d * 2.0, d * 2.0);
+                } else {
+                    GdipFillEllipse(g, brush, cx - d, cy + 7.2 * u, d * 2.0, d * 2.0);
+                }
             }
             GdipDeleteBrush(brush);
         }
@@ -1465,7 +1632,13 @@ unsafe fn draw(
     if l.output.w > 0.0 {
         let b = l.output;
         if f.outputs_open || f.hover == Hit::Output {
-            let c = if f.outputs_open || f.pressed == Hit::Output { plate_down } else { plate };
+            let c = if f.outputs_open {
+                plate_open
+            } else if f.pressed == Hit::Output {
+                plate_down
+            } else {
+                plate
+            };
             fill_round_color(g, c, b, radius);
         }
         let color = if f.hover == Hit::Output || f.outputs_open { primary } else { dim };
@@ -1476,7 +1649,13 @@ unsafe fn draw(
     if l.vol_icon.w > 0.0 {
         let b = l.vol_icon;
         if f.mixer_open || f.hover == Hit::VolIcon {
-            let c = if f.mixer_open || f.pressed == Hit::VolIcon { plate_down } else { plate };
+            let c = if f.mixer_open {
+                plate_open
+            } else if f.pressed == Hit::VolIcon {
+                plate_down
+            } else {
+                plate
+            };
             fill_round_color(g, c, b, radius);
         }
         let color = if f.hover == Hit::VolIcon || f.mixer_open { primary } else { dim };
@@ -1508,26 +1687,37 @@ unsafe fn draw(
         String::new()
     };
     let mut overflow = 0.0;
+    // A title with nothing under it (no seek bar, no second line of text)
+    // sits in the middle of the taskbar rather than in the top half.
+    let alone = l.stacked && !f.has_timeline && f.below.is_empty() && f.volume.is_none();
+    let row1 = if alone {
+        let y = ((f.h as f32 - l.row1.h / k as f32) / 2.0).floor() * k as f32;
+        Rect { y, ..l.row1 }
+    } else {
+        l.row1
+    };
     if l.row1.w > 0.0 {
-    let unbounded = Rect { w: 100_000.0, ..l.row1 };
+    let l_row1 = row1;
+    let unbounded = Rect { w: 100_000.0, ..l_row1 };
     let title_full = measure(g, title, title_font, unbounded, free);
     let artist_full = measure(g, &artist, body_font, unbounded, free);
-    overflow = title_full + artist_full + 2.0 * u - l.row1.w;
+    // (Measured widths include a little padding after each string.)
+    overflow = title_full + artist_full - 2.0 * u - l_row1.w;
 
     if f.scroll && overflow > 0.0 {
         // Too long: draw it whole, shifted left, and clip to the row.
-        let x = l.row1.x - (f.scroll_px * k) as f32;
-        GdipSetClipRect(g, l.row1.x, l.row1.y, l.row1.w, l.row1.h, CombineModeReplace);
-        draw_text(g, title, title_font, Rect { x, w: title_full + 8.0 * u, ..l.row1 }, free, primary);
-        let r = Rect { x: x + title_full, w: artist_full + 8.0 * u, ..l.row1 };
+        let x = l_row1.x - f.scroll_px as f32;
+        GdipSetClipRect(g, l_row1.x, l_row1.y, l_row1.w, l_row1.h, CombineModeReplace);
+        draw_text(g, title, title_font, Rect { x, w: title_full + 8.0 * u, ..l_row1 }, free, primary);
+        let r = Rect { x: x + title_full, w: artist_full + 8.0 * u, ..l_row1 };
         draw_text(g, &artist, body_font, r, free, dim);
         GdipResetClip(g);
     } else {
-        let title_w = title_full.min(l.row1.w);
-        draw_text(g, title, title_font, l.row1, near, primary);
-        let rest = l.row1.w - title_w;
+        let title_w = title_full.min(l_row1.w);
+        draw_text(g, title, title_font, l_row1, near, primary);
+        let rest = l_row1.w - title_w;
         if !artist.is_empty() && rest > 36.0 * u {
-            let r = Rect { x: l.row1.x + title_w, w: rest, ..l.row1 };
+            let r = Rect { x: l_row1.x + title_w, w: rest, ..l_row1 };
             draw_text(g, &artist, body_font, r, near, dim);
         }
     }
@@ -1756,6 +1946,56 @@ unsafe fn art_accent(bitmap: *mut GpBitmap, size: i32) -> Option<(f32, f32)> {
     Some((hue_sum[best] / weight[best], sat_sum[best] / weight[best]))
 }
 
+/// Relative luminance (0 black .. 1 white) of an 0xRRGGBB color.
+fn luminance(color: u32) -> f32 {
+    let channel = |shift: u32| {
+        let c = ((color >> shift) & 0xFF) as f32 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+}
+
+/// Contrast ratio (1..21) between two colors.
+fn contrast(a: u32, b: u32) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `color`, lightened (against something dark) or darkened (against
+/// something light) just enough to stand out from `behind` (0xRRGGBB): a
+/// contrast of at least 3:1. Colors that already do are unchanged.
+pub fn readable(color: u32, behind: u32) -> u32 {
+    let toward: u32 = if luminance(behind) > 0.4 { 0x00 } else { 0xFF };
+    let mut out = color;
+    for _ in 0..40 {
+        if contrast(out, behind) >= 3.0 {
+            break;
+        }
+        let mix = |shift: u32| {
+            let c = (out >> shift) & 0xFF;
+            // An eighth of the way toward white / black each step, and
+            // always at least one level, until it gets there.
+            let next = (c * 7 + toward + 4) / 8;
+            let next = if next != c {
+                next
+            } else if toward > c {
+                c + 1
+            } else if toward < c {
+                c - 1
+            } else {
+                c
+            };
+            next << shift
+        };
+        out = (out & 0xFF00_0000) | mix(16) | mix(8) | mix(0);
+    }
+    out
+}
+
 /// A readable version of the art's color for the current taskbar theme.
 fn accent_color((hue, sat): (f32, f32), light_taskbar: bool) -> u32 {
     let (s, v) = if light_taskbar { (sat.clamp(0.55, 1.0), 0.62) } else { (sat.clamp(0.40, 0.72), 1.0) };
@@ -1780,8 +2020,30 @@ unsafe fn fill_round_color(g: *mut GpGraphics, color: u32, r: Rect, radius: f32)
     GdipDeleteBrush(brush);
 }
 
+thread_local! {
+    /// The smallest font size worth drawing, in pixels of the picture being
+    /// drawn (so: real pixels times the enlargement). Set by each draw call.
+    static FONT_FLOOR: std::cell::Cell<f32> = const { std::cell::Cell::new(6.0) };
+    /// Where the next picture shown in a window should put that window, if
+    /// it is to move as well (see `place_next`).
+    static NEXT_PLACE: std::cell::Cell<Option<(i32, i32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Have the next picture painted into a window also move the window to
+/// (x, y), in the same step, so that a popup that changes size never shows
+/// for a moment at its old place. Cleared by `place_next_clear`.
+pub fn place_next(x: i32, y: i32) {
+    NEXT_PLACE.with(|p| p.set(Some((x, y))));
+}
+
+pub fn place_next_clear() {
+    NEXT_PLACE.with(|p| p.set(None));
+}
+
 /// `bold` uses Segoe UI's own semibold face, and the bold style elsewhere.
 unsafe fn make_font(family: &str, px: f32, bold: bool) -> *mut GpFont {
+    // Nothing smaller than six real pixels: below that, text is a smudge.
+    let px = px.max(FONT_FLOOR.with(|f| f.get()));
     let (name, style) = match (family, bold) {
         ("Segoe UI", true) => ("Segoe UI Semibold", 0),
         (_, true) => (family, 1),
@@ -1959,5 +2221,340 @@ unsafe fn scale_art(bytes: &[u8], size: i32, spotify: bool) -> Option<*mut GpBit
         None
     } else {
         Some(dst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{default_layout, ITEMS};
+
+    fn params(order: &[u8], height: i32, scale: f32) -> LayoutParams {
+        let mut o = [0u8; ITEM_COUNT];
+        o[..order.len()].copy_from_slice(order);
+        LayoutParams {
+            height,
+            scale,
+            time_chars: 4,
+            text_size: 1,
+            width: 1,
+            show_times: true,
+            mini: false,
+            extra: true,
+            players: true,
+            order: o,
+            button_size: 1,
+            seek_size: 1,
+            gap: 1,
+            stack: false,
+        }
+    }
+
+    fn default_order() -> Vec<u8> {
+        default_layout(true).iter().filter(|(_, shown)| *shown).map(|(item, _)| *item).collect()
+    }
+
+    /// Every rectangle that is drawn as its own item, left to right.
+    fn columns(l: &Layout) -> Vec<Rect> {
+        let mut all = vec![l.gear, l.players, l.art, l.output, l.vol_icon, l.row1];
+        all.extend(l.buttons);
+        if l.stacked_extras {
+            all.push(l.extras[0]);
+        } else {
+            all.extend(l.extras);
+        }
+        if !l.stacked {
+            all.push(l.row2);
+        }
+        let mut shown: Vec<Rect> = all.into_iter().filter(|r| r.w > 0.0).collect();
+        shown.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+        shown
+    }
+
+    fn check(l: &Layout, what: &str) {
+        let cols = columns(l);
+        assert!(!cols.is_empty(), "{what}: nothing shown");
+        assert!(l.width >= 12.0 * l.u, "{what}: no width");
+        for pair in cols.windows(2) {
+            assert!(pair[0].x + pair[0].w <= pair[1].x + 0.01, "{what}: items overlap: {:?} {:?}", pair[0], pair[1]);
+        }
+        let last = cols.last().unwrap();
+        assert!(last.x + last.w <= l.width + 0.01, "{what}: past the right edge");
+        assert!(cols[0].x >= 0.0, "{what}: past the left edge");
+    }
+
+    #[test]
+    fn default_layout_at_common_sizes() {
+        for (height, scale) in [(40, 1.0), (30, 1.0), (48, 1.0), (50, 1.25), (60, 1.5), (72, 1.5), (80, 2.0), (96, 2.0)] {
+            let l = Layout::new(&params(&default_order(), height, scale));
+            check(&l, &format!("default {height}px at {scale}"));
+            // Everything on whole pixels, so nothing is drawn blurred.
+            for r in [l.art, l.buttons[0], l.buttons[1], l.buttons[2], l.track] {
+                assert_eq!(r.x.fract(), 0.0, "x of {r:?} at {height}/{scale}");
+                assert_eq!(r.y.fract(), 0.0, "y of {r:?} at {height}/{scale}");
+            }
+            assert!(l.row1.y >= 0.0 && l.row2.y + l.row2.h <= height as f32 + 0.5, "text rows fit in {height}px");
+        }
+    }
+
+    #[test]
+    fn every_single_item_and_every_pair_lays_out() {
+        let all: Vec<u8> = ITEMS.iter().map(|(item, _, _)| *item).collect();
+        for a in &all {
+            check(&Layout::new(&params(&[*a], 40, 1.0)), &format!("item {a}"));
+            for b in &all {
+                if a != b {
+                    for stack in [false, true] {
+                        let mut p = params(&[*a, *b], 40, 1.0);
+                        p.stack = stack;
+                        check(&Layout::new(&p), &format!("items {a},{b} stack={stack}"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_rotation_of_everything_lays_out() {
+        let mut order: Vec<u8> = ITEMS.iter().map(|(item, _, _)| *item).filter(|i| *i != ITEM_INFO).collect();
+        for _ in 0..order.len() {
+            order.rotate_left(1);
+            for (gap, size) in [(0, 0), (4, 2), (2, 1)] {
+                let mut p = params(&order, 40, 1.0);
+                p.gap = gap;
+                p.button_size = size;
+                check(&Layout::new(&p), &format!("order {order:?}"));
+                p.stack = true;
+                check(&Layout::new(&p), &format!("stacked order {order:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_usable_still_shows_something() {
+        // Only the switcher, with one player and "hide unusable".
+        let mut p = params(&[ITEM_PLAYERS], 40, 1.0);
+        p.players = false;
+        let l = Layout::new(&p);
+        assert!(l.art.w > 0.0);
+        // Only text, squeezed into the small form.
+        let mut p = params(&[ITEM_INFO], 40, 1.0);
+        p.mini = true;
+        assert!(Layout::new(&p).art.w > 0.0);
+        // Nothing at all.
+        assert!(Layout::new(&params(&[], 40, 1.0)).art.w > 0.0);
+    }
+
+    #[test]
+    fn clicks_land_on_what_is_drawn() {
+        for order in [default_order(), vec![ITEM_PREV, ITEM_GEAR, ITEM_PLAY, ITEM_PLAYERS, ITEM_NEXT, ITEM_ART, ITEM_VOLUME, ITEM_OUTPUT]] {
+            let l = Layout::new(&params(&order, 40, 1.0));
+            let mid = 20.0;
+            let expect = [
+                (l.buttons[0], Hit::Prev),
+                (l.buttons[1], Hit::Play),
+                (l.buttons[2], Hit::Next),
+                (l.vol_icon, Hit::VolIcon),
+                (l.output, Hit::Output),
+                (l.art, Hit::Art),
+            ];
+            for (r, hit) in expect {
+                if r.w > 0.0 {
+                    // Both edge pixels and the middle belong to the item.
+                    for x in [r.x, r.x + r.w / 2.0, r.x + r.w - 1.0] {
+                        assert_eq!(l.hit(x, mid, true), hit, "x={x} in {r:?} order {order:?}");
+                    }
+                }
+            }
+            if l.gear.w > 0.0 {
+                assert_eq!(l.hit(l.gear.cx(), l.gear.cy(), true), Hit::Gear);
+            }
+            if l.players.w > 0.0 {
+                assert_eq!(l.hit(l.players.cx(), l.players.y + 1.0, true), Hit::PlayerUp);
+                assert_eq!(l.hit(l.players.cx(), l.players.y + l.players.h - 1.0, true), Hit::PlayerDown);
+            }
+        }
+        let l = Layout::new(&params(&default_order(), 40, 1.0));
+        assert_eq!(l.hit(l.track.cx(), l.track.cy(), true), Hit::Seek);
+        // With no timeline the seek row is not a target; the title, drawn
+        // in the middle then, takes the whole column.
+        assert_eq!(l.hit(l.track.cx(), l.track.cy(), false), Hit::Title);
+        assert_eq!(l.hit(l.row1.cx(), l.row1.y + 2.0, true), Hit::Title);
+        assert_eq!(l.hit(-5.0, 20.0, true), Hit::None);
+        assert!((l.seek_fraction(l.track.x) - 0.0).abs() < 1e-6);
+        assert!((l.seek_fraction(l.track.x + l.track.w) - 1.0).abs() < 1e-6);
+        assert!((l.seek_fraction(l.track.cx()) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn every_pixel_of_every_button_is_its_own_in_any_order() {
+        // In particular the seek bar's generous click zone must not reach
+        // into its neighbours, with the time labels on or off.
+        let mut order: Vec<u8> = ITEMS.iter().map(|(item, _, _)| *item).filter(|i| *i != ITEM_TITLE && *i != ITEM_SEEK).collect();
+        for _ in 0..order.len() {
+            order.rotate_left(1);
+            for show_times in [true, false] {
+                for (height, scale) in [(40, 1.0), (30, 1.0), (60, 1.5), (50, 1.25)] {
+                    let mut p = params(&order, height, scale);
+                    p.show_times = show_times;
+                    let l = Layout::new(&p);
+                    let expect = [
+                        (l.buttons[0], Hit::Prev),
+                        (l.buttons[1], Hit::Play),
+                        (l.buttons[2], Hit::Next),
+                        (l.extras[0], Hit::Shuffle),
+                        (l.extras[1], Hit::Repeat),
+                        (l.vol_icon, Hit::VolIcon),
+                        (l.output, Hit::Output),
+                        (l.art, Hit::Art),
+                    ];
+                    for (r, hit) in expect {
+                        let mut x = r.x;
+                        while x < r.x + r.w {
+                            for y in [1.0, height as f32 / 2.0, height as f32 - 1.0] {
+                                assert_eq!(l.hit(x, y, true), hit, "x={x} y={y} of {r:?}, order {order:?}, times {show_times}");
+                            }
+                            x += 1.0;
+                        }
+                    }
+                    // And the seek zone stays inside the text block.
+                    assert!(l.seek_hit.x >= l.row2.x && l.seek_hit.x + l.seek_hit.w <= l.row2.x + l.row2.w + 0.01);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_is_followed_by_a_gap() {
+        for after in [ITEM_ART, ITEM_GEAR, ITEM_PLAYERS] {
+            for text in [ITEM_INFO, ITEM_TITLE, ITEM_SEEK] {
+                let l = Layout::new(&params(&[text, after], 40, 1.0));
+                let block = if text == ITEM_SEEK { l.row2 } else { l.row1 };
+                let next = match after {
+                    ITEM_ART => l.art,
+                    ITEM_GEAR => l.gear,
+                    _ => l.players,
+                };
+                assert!(next.x >= block.x + block.w + 6.0, "{text} then {after}: {block:?} {next:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_title_with_nothing_under_it_is_clickable_all_the_way_down() {
+        let l = Layout::new(&params(&default_order(), 40, 1.0));
+        for y in [2.0, 20.0, 38.0] {
+            assert_eq!(l.hit(l.row1.cx(), y, false), Hit::Title);
+        }
+        // With a seek bar, only the title's own row.
+        assert_eq!(l.hit(l.row1.cx(), l.row1.y + 2.0, true), Hit::Title);
+        assert_eq!(l.hit(l.track.cx(), 38.0, true), Hit::Seek);
+    }
+
+    #[test]
+    fn stacked_shuffle_and_repeat_share_a_column() {
+        let mut p = params(&[ITEM_ART, ITEM_SHUFFLE, ITEM_PLAY, ITEM_REPEAT], 40, 1.0);
+        p.stack = true;
+        let l = Layout::new(&p);
+        assert!(l.stacked_extras);
+        assert_eq!(l.extras[0].x, l.extras[1].x);
+        assert_eq!(l.extras[0].y + l.extras[0].h, l.extras[1].y);
+        assert_eq!(l.hit(l.extras[0].cx(), l.extras[0].cy(), true), Hit::Shuffle);
+        assert_eq!(l.hit(l.extras[1].cx(), l.extras[1].cy(), true), Hit::Repeat);
+    }
+
+    #[test]
+    fn narrower_settings_are_narrower() {
+        let width = |f: &dyn Fn(&mut LayoutParams)| {
+            let mut p = params(&default_order(), 40, 1.0);
+            f(&mut p);
+            Layout::new(&p).width
+        };
+        let normal = width(&|_| {});
+        assert!(width(&|p| p.width = 0) < normal);
+        assert!(width(&|p| p.width = 2) > normal);
+        assert!(width(&|p| p.gap = 0) < normal);
+        assert!(width(&|p| p.button_size = 0) < normal);
+        assert!(width(&|p| p.mini = true) < width(&|p| p.width = 0));
+    }
+
+    #[test]
+    fn enlarging_a_layout_keeps_its_proportions() {
+        let l = Layout::new(&params(&default_order(), 50, 1.25));
+        let big = l.scaled(3);
+        assert_eq!(big.width, l.width * 3.0);
+        assert_eq!(big.art, l.art.times(3.0));
+        assert_eq!(big.track, l.track.times(3.0));
+        assert_eq!(big.stacked, l.stacked);
+    }
+
+    #[test]
+    fn popup_layouts_hold_their_rows() {
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            for n in [1usize, 2, 7, 20] {
+                let m = mixer_layout(scale, n, false);
+                assert_eq!(m.rows.len(), n);
+                let last = m.rows.last().unwrap().row;
+                assert!(last.y + last.h <= m.h as f32 + 1.0, "mixer rows fit at {scale} x{n}");
+                for r in &m.rows {
+                    assert!(r.track.x >= r.name.x + r.name.w && r.track.x + r.track.w <= r.percent.x);
+                    assert!(r.percent.x + r.percent.w <= m.w as f32);
+                }
+                let (w, h, rows) = picker_layout(scale, n, false);
+                assert!(rows.last().unwrap().y + rows.last().unwrap().h <= h as f32 + 1.0);
+                assert!(rows.iter().all(|r| r.x + r.w <= w as f32));
+                // The "and N more" line adds its height and nothing else.
+                let with = mixer_layout(scale, n, true);
+                assert!(with.h > m.h && with.footer.h > 0.0 && m.footer.h == 0.0);
+                assert!(with.footer.y >= with.rows.last().unwrap().row.y + with.rows.last().unwrap().row.h);
+                assert!(with.footer.y + with.footer.h <= with.h as f32);
+                assert!(picker_layout(scale, n, true).1 > h);
+            }
+            let kinds = [0u8, 0, 2, 1, 0, 0, 0, 2, 0, 0];
+            let (_, h, rows) = menu_layout(scale, &kinds);
+            assert_eq!(rows.len(), kinds.len());
+            assert!(rows.last().unwrap().y + rows.last().unwrap().h <= h as f32 + 1.0);
+            for pair in rows.windows(2) {
+                assert_eq!(pair[0].y + pair[0].h, pair[1].y);
+            }
+        }
+    }
+
+    #[test]
+    fn highlight_colors_stand_out() {
+        let dark_bar = 0x0020_2020;
+        let light_bar = 0x00EE_EEEE;
+        // Including taskbars in an accent color, light, dark and in between.
+        let bars = [dark_bar, light_bar, 0x0000_78D4, 0x00E8_1123, 0x00FF_B900, 0x0080_8080, 0x0000_0000, 0x00FF_FFFF];
+        for color in [0xFF00_0000u32, 0xFF10_1040, 0xFF4C_C2FF, 0xFFFF_FFFF, 0xFF80_8000, 0xFFFF_FF00, 0xFF12_3456, 0xFF99_0000, 0xFF00_78D4] {
+            for bar in bars {
+                let out = readable(color, bar);
+                assert!(contrast(out, bar) >= 3.0, "{color:#x} on {bar:#x} gave {out:#x}");
+                assert_eq!(out >> 24, color >> 24, "alpha is kept");
+            }
+        }
+        // Colors that are already fine are left exactly as chosen.
+        assert_eq!(readable(0xFF4C_C2FF, dark_bar), 0xFF4C_C2FF);
+        assert_eq!(readable(0xFF00_3366, light_bar), 0xFF00_3366);
+        // The Windows accent on a taskbar of that same color still shows.
+        assert!(contrast(readable(0xFF00_78D4, 0x0000_78D4), 0x0000_78D4) >= 3.0);
+        // Every hue the album art can produce.
+        for step in 0..60 {
+            let hue = step as f32 / 10.0;
+            for sat in [0.2, 0.6, 1.0] {
+                assert!(contrast(readable(accent_color((hue, sat), false), dark_bar), dark_bar) >= 3.0);
+                assert!(contrast(readable(accent_color((hue, sat), true), light_bar), light_bar) >= 3.0);
+            }
+        }
+    }
+
+    #[test]
+    fn averaging_down_keeps_flat_color_and_alpha() {
+        let k = 3;
+        let (w, h) = (4usize, 2usize);
+        let src = vec![0x8040_2010u32; w * k * h * k];
+        let mut dst = vec![0u32; w * h];
+        downsample(&src, w * k, &mut dst, w, h, k);
+        assert!(dst.iter().all(|p| *p == 0x8040_2010));
     }
 }

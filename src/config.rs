@@ -192,7 +192,21 @@ fn parse_layout(text: &str) -> Vec<(u8, bool)> {
             layout.push((item, !hidden_by_default(item)));
         }
     }
+    ensure_visible(&mut layout);
     layout
+}
+
+/// A layout with nothing shown would leave an invisible widget that cannot
+/// be clicked to fix it: show the album art and play button again.
+pub fn ensure_visible(layout: &mut [(u8, bool)]) {
+    if layout.iter().any(|(_, shown)| *shown) {
+        return;
+    }
+    for entry in layout.iter_mut() {
+        if entry.0 == ITEM_ART || entry.0 == ITEM_PLAY {
+            entry.1 = true;
+        }
+    }
 }
 
 fn format_layout(layout: &[(u8, bool)]) -> String {
@@ -224,9 +238,12 @@ impl Config {
         order
     }
 
-    /// Replace the layout (the other taskbars' one if `other`) and the
-    /// options that shape it with a ready-made arrangement: 1 default,
-    /// 2 minimal, 3 compact, 4 everything, 5 classic.
+    /// Replace the layout with a ready-made arrangement: 1 default, 2 minimal,
+    /// 3 compact, 4 everything, 5 classic. For the main taskbar this also
+    /// sets the options that shape it (text width, spacing, button size,
+    /// stacking, what the text shows). Those options are shared by every
+    /// taskbar, so a preset for the *other* taskbars (`other`) only changes
+    /// which items they show and leaves the main taskbar's look alone.
     pub fn apply_preset(&mut self, preset: usize, other: bool) {
         // The given items shown in that order, everything else hidden.
         let showing = |shown: &[u8]| {
@@ -259,9 +276,9 @@ impl Config {
         };
         if other {
             self.layout2 = layout;
-        } else {
-            self.layout = layout;
+            return;
         }
+        self.layout = layout;
         self.width = width;
         self.button_gap = gap;
         self.button_size = 1;
@@ -379,6 +396,12 @@ impl Config {
     }
 }
 
+/// Whether Windows is set to show the accent color on the taskbar ("Show
+/// accent color on Start and taskbar").
+pub fn accent_on_taskbar() -> bool {
+    read_dword(THEME_KEY, w!("ColorPrevalence")) == Some(1)
+}
+
 /// Whether the taskbar uses the light Windows theme.
 pub fn system_light_theme() -> bool {
     read_dword(THEME_KEY, w!("SystemUsesLightTheme")) == Some(1)
@@ -415,7 +438,7 @@ fn write_dword(key: PCWSTR, value: PCWSTR, data: u32) {
 }
 
 fn read_string(key: PCWSTR, value: PCWSTR) -> Option<String> {
-    let mut buf = [0u16; 260];
+    let mut buf = [0u16; 600];
     let mut size = (buf.len() * 2) as u32;
     let status = unsafe {
         RegGetValueW(
@@ -457,31 +480,73 @@ pub fn autostart_enabled() -> bool {
     status == ERROR_SUCCESS
 }
 
-/// Adds or removes this exe (at its current path) from the per-user Run key.
-pub fn set_autostart(enable: bool) {
+/// If "Start with Windows" is on but the file it points at is gone (the exe
+/// was moved or renamed), point it at the exe that is running now. Without
+/// this the option stays ticked while Windows starts nothing at all.
+///
+/// A target that still exists is left alone, even if it is another copy:
+/// trying a second copy from a download folder must not quietly take over
+/// startup. (Re-ticking the option in Settings always points it here.)
+pub fn refresh_autostart() {
+    let Some(saved) = read_string(RUN_KEY, RUN_VALUE) else { return };
+    let target = saved.trim().trim_matches('"');
+    if !target.is_empty() && !std::path::Path::new(target).exists() {
+        set_autostart(true);
+    }
+}
+
+/// The exe "Start with Windows" will start, if it is on and that is not the
+/// exe running now.
+pub fn autostart_elsewhere() -> Option<String> {
+    let saved = read_string(RUN_KEY, RUN_VALUE)?;
+    let target = saved.trim().trim_matches('"').to_string();
+    let mut path = [0u16; 1024];
+    let len = unsafe { GetModuleFileNameW(None, &mut path) } as usize;
+    if len == 0 || len >= path.len() {
+        return None;
+    }
+    let current = String::from_utf16_lossy(&path[..len]);
+    (!target.eq_ignore_ascii_case(&current)).then_some(target)
+}
+
+const STATE_KEY: PCWSTR = w!("Software\\TaskbarMedia\\State");
+
+/// Small facts the app keeps for itself between runs (not settings: they are
+/// not exported). 0 when never written.
+pub fn state_get(name: PCWSTR) -> u32 {
+    read_dword(STATE_KEY, name).unwrap_or(0)
+}
+
+pub fn state_set(name: PCWSTR, value: u32) {
+    write_dword(STATE_KEY, name, value);
+}
+
+/// Adds or removes this exe (at its current path) from the per-user Run
+/// key. Returns whether the registry now says what was asked.
+pub fn set_autostart(enable: bool) -> bool {
     unsafe {
         if !enable {
             let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
-            return;
+            return !autostart_enabled();
         }
         let mut path = [0u16; 1024];
         let len = GetModuleFileNameW(None, &mut path) as usize;
         if len == 0 || len >= path.len() {
-            return;
+            return false;
         }
         let mut cmd: Vec<u16> = Vec::with_capacity(len + 3);
         cmd.push(b'"' as u16);
         cmd.extend_from_slice(&path[..len]);
         cmd.push(b'"' as u16);
         cmd.push(0);
-        let _ = RegSetKeyValueW(
+        RegSetKeyValueW(
             HKEY_CURRENT_USER,
             RUN_KEY,
             RUN_VALUE,
             REG_SZ.0,
             Some(cmd.as_ptr() as *const c_void),
             (cmd.len() * 2) as u32,
-        );
+        ) == ERROR_SUCCESS
     }
 }
 
@@ -489,7 +554,7 @@ pub fn set_autostart(enable: bool) {
 /// line. Reads the registry directly, so new settings are covered
 /// automatically.
 pub fn export_text() -> String {
-    let mut out = String::from("; Taskbar Media settings\r\n");
+    let mut out = format!("{EXPORT_HEADER}\r\n");
     unsafe {
         let mut key = HKEY::default();
         if RegOpenKeyExW(HKEY_CURRENT_USER, SETTINGS_KEY, None, KEY_READ, &mut key) != ERROR_SUCCESS {
@@ -537,24 +602,7 @@ pub fn export_text() -> String {
 /// `export_text`). Returns false, changing nothing, if no setting was found
 /// in it. Values are range-checked later, when the settings are loaded.
 pub fn import_text(text: &str) -> bool {
-    let mut values: Vec<(String, Result<u32, String>)> = Vec::new();
-    for line in text.lines().take(1000) {
-        let line = line.trim();
-        let Some((name, value)) = line.split_once('=') else { continue };
-        let name = name.trim();
-        if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
-            continue;
-        }
-        if let Some(number) = value.strip_prefix("dword:") {
-            if let Ok(number) = number.trim().parse::<u32>() {
-                values.push((name.to_string(), Ok(number)));
-            }
-        } else if let Some(text) = value.strip_prefix("str:") {
-            if text.len() <= 512 {
-                values.push((name.to_string(), Err(text.to_string())));
-            }
-        }
-    }
+    let values = parse_import(text);
     if values.is_empty() {
         return false;
     }
@@ -569,10 +617,201 @@ pub fn import_text(text: &str) -> bool {
     true
 }
 
+/// The settings in an exported file: (name, number or text). Empty unless
+/// the text really is a Taskbar Media export: it must carry the header line
+/// or one of the settings every export contains, so that picking some other
+/// "name=value" file by mistake cannot wipe the current settings.
+fn parse_import(text: &str) -> Vec<(String, Result<u32, String>)> {
+    let mut values: Vec<(String, Result<u32, String>)> = Vec::new();
+    // Notepad may have saved it with a byte-order mark.
+    let text = text.trim_start_matches('\u{feff}');
+    let mut recognised = text.lines().take(5).any(|l| l.trim() == EXPORT_HEADER);
+    for line in text.lines().take(1000) {
+        let line = line.trim();
+        let Some((name, value)) = line.split_once('=') else { continue };
+        let name = name.trim();
+        if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let before = values.len();
+        if let Some(number) = value.strip_prefix("dword:") {
+            if let Ok(number) = number.trim().parse::<u32>() {
+                values.push((name.to_string(), Ok(number)));
+            }
+        } else if let Some(text) = value.strip_prefix("str:") {
+            // No longer than a saved string can be read back.
+            if text.encode_utf16().count() <= MAX_STRING {
+                values.push((name.to_string(), Err(text.to_string())));
+            }
+        }
+        // Only a line that was actually usable can vouch for the file.
+        recognised |= values.len() > before
+            && matches!(name, "Layout" | "DisplayMode" | "TextSize" | "ButtonSize");
+    }
+    if !recognised {
+        values.clear();
+    }
+    values
+}
+
+const EXPORT_HEADER: &str = "; Taskbar Media settings";
+/// The longest string setting, in UTF-16 units (see `read_string`).
+const MAX_STRING: usize = 250;
+
 /// Forget every saved setting. ("Start with Windows" is stored elsewhere and
 /// is not affected.)
 pub fn reset_all() {
+    // The app's own notes (a taskbar reservation in force) are not settings
+    // and must outlive this.
+    let reserved = state_get(w!("ReservedEdge"));
     unsafe {
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, SETTINGS_KEY);
+    }
+    if reserved != 0 {
+        state_set(w!("ReservedEdge"), reserved);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl Config {
+        /// The defaults, without touching the registry.
+        fn load_defaults_for_tests() -> Config {
+            Config {
+                display_mode: DISPLAY_MAIN,
+                display_name: String::new(),
+                text_size: 1,
+                width: 1,
+                smooth: true,
+                text_color: 0,
+                show_times: true,
+                hide_paused: false,
+                spotify_only: false,
+                scroll_titles: true,
+                wheel_mode: 2,
+                layout: default_layout(true),
+                layout2: default_layout(true),
+                layout2_on: false,
+                text_rgb: 0xFFFF_FFFF,
+                accent_rgb: 0xFF4C_C2FF,
+                hover_card: true,
+                button_size: 1,
+                text_layout: 0,
+                font: 0,
+                accent_mode: 0,
+                art_shape: 0,
+                seek_size: 1,
+                background: 0,
+                art_click: 0,
+                title_click: 0,
+                button_gap: 1,
+                stack_extras: false,
+                hide_unusable: false,
+                volume_target: 0,
+                output_click: 0,
+                output_a: String::new(),
+                output_b: String::new(),
+                check_updates: true,
+                avoid_apps: true,
+                tray_icon: true,
+                offset: 0,
+                offset2: 0,
+            }
+        }
+    }
+
+    fn shown(layout: &[(u8, bool)]) -> Vec<u8> {
+        layout.iter().filter(|(_, s)| *s).map(|(i, _)| *i).collect()
+    }
+
+    fn complete(layout: &[(u8, bool)]) -> bool {
+        layout.len() == ITEM_COUNT && ITEMS.iter().all(|(item, _, _)| layout.iter().filter(|(i, _)| i == item).count() == 1)
+    }
+
+    #[test]
+    fn default_layout_has_every_item_once() {
+        assert!(complete(&default_layout(true)));
+        assert!(complete(&default_layout(false)));
+        assert!(!shown(&default_layout(false)).contains(&ITEM_SHUFFLE));
+        assert!(shown(&default_layout(true)).contains(&ITEM_REPEAT));
+        assert!(!shown(&default_layout(true)).contains(&ITEM_GEAR));
+    }
+
+    #[test]
+    fn layout_round_trips() {
+        let layout = default_layout(true);
+        assert!(parse_layout(&format_layout(&layout)) == layout);
+    }
+
+    #[test]
+    fn parse_drops_unknown_and_duplicates_and_adds_missing() {
+        let layout = parse_layout("players,art,bogus,art,-play,,  next ");
+        assert!(complete(&layout));
+        assert_eq!(&shown(&layout)[..3], &[ITEM_PLAYERS, ITEM_ART, ITEM_NEXT]);
+        assert!(layout.contains(&(ITEM_PLAY, false)));
+    }
+
+    #[test]
+    fn old_layouts_gain_the_player_switcher_where_the_gear_was() {
+        let layout = parse_layout("gear,art,prev,play,next,info");
+        assert!(complete(&layout));
+        let at = |item| layout.iter().position(|(i, _)| *i == item).unwrap();
+        assert_eq!(at(ITEM_PLAYERS) + 1, at(ITEM_ART));
+        assert!(layout.contains(&(ITEM_GEAR, false)));
+    }
+
+    #[test]
+    fn a_layout_can_never_be_empty() {
+        let all_hidden: Vec<String> = ITEMS.iter().map(|(_, key, _)| format!("-{key}")).collect();
+        let layout = parse_layout(&all_hidden.join(","));
+        assert_eq!(shown(&layout).len(), 2);
+        assert!(shown(&layout).contains(&ITEM_ART) && shown(&layout).contains(&ITEM_PLAY));
+        assert!(!shown(&parse_layout("")).is_empty());
+    }
+
+    #[test]
+    fn presets_are_complete_and_the_other_taskbar_keeps_the_look() {
+        let mut c = Config::load_defaults_for_tests();
+        for preset in 1..=5 {
+            c.apply_preset(preset, false);
+            assert!(complete(&c.layout), "preset {preset}");
+            assert!(!shown(&c.layout).is_empty());
+        }
+        c.width = 2;
+        c.text_layout = 3;
+        c.button_gap = 4;
+        let main = c.layout.clone();
+        c.apply_preset(2, true);
+        assert!(complete(&c.layout2));
+        assert!(c.layout == main);
+        assert_eq!((c.width, c.text_layout, c.button_gap), (2, 3, 4));
+    }
+
+    #[test]
+    fn import_needs_a_real_export() {
+        assert!(parse_import("X=dword:1").is_empty());
+        // A known name with a broken value vouches for nothing.
+        assert!(parse_import("Layout=dword:oops\nX=dword:1").is_empty());
+        // A byte-order mark in front is fine.
+        assert_eq!(parse_import("\u{feff}; Taskbar Media settings\nWidth=dword:1").len(), 1);
+        assert!(parse_import("just some text\nmore=text").is_empty());
+        let good = parse_import("; Taskbar Media settings\r\nWidth=dword:2\r\nOutputA=str:{0.0.0}.{abc}\r\n");
+        assert_eq!(good.len(), 2);
+        assert!(good[0] == ("Width".to_string(), Ok(2)));
+        assert!(good[1] == ("OutputA".to_string(), Err("{0.0.0}.{abc}".to_string())));
+        // No header, but an unmistakable setting.
+        assert_eq!(parse_import("Layout=str:art,play").len(), 1);
+    }
+
+    #[test]
+    fn import_skips_bad_lines() {
+        let v = parse_import(&format!(
+            "; Taskbar Media settings\nbad name=dword:1\nA=dword:x\nB=str:{}\nC=dword:7\n=dword:1",
+            "z".repeat(600)
+        ));
+        assert_eq!(v.len(), 1);
+        assert!(v[0] == ("C".to_string(), Ok(7)));
     }
 }

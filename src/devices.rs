@@ -107,6 +107,11 @@ pub fn set_default(id: &str) -> bool {
         return false;
     }
     let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+    // Where to go back to if only half of the switch works.
+    let previous: Option<Vec<u16>> = current()
+        .map(|d| d.id)
+        .filter(|old| old != id)
+        .map(|old| old.encode_utf16().chain(std::iter::once(0)).collect());
     unsafe {
         let Ok(unknown) = CoCreateInstance::<_, IUnknown>(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL) else {
             return false;
@@ -119,10 +124,19 @@ pub fn set_default(id: &str) -> bool {
         let set: SetDefaultEndpoint = std::mem::transmute(*vtable.add(SET_DEFAULT_ENDPOINT));
         let release: Release = std::mem::transmute(*vtable.add(RELEASE));
         // Roles 0 (console) and 1 (multimedia): what the Windows flyout
-        // changes. Role 2, the device for calls, is left alone.
-        let ok = set(policy, PCWSTR(wide.as_ptr()), 0).is_ok();
-        let _ = set(policy, PCWSTR(wide.as_ptr()), 1);
+        // changes. Role 2, the device for calls, is left alone. Both must
+        // succeed: `current()` reads the multimedia role.
+        let console = set(policy, PCWSTR(wide.as_ptr()), 0).is_ok();
+        let multimedia = set(policy, PCWSTR(wide.as_ptr()), 1).is_ok();
+        // Never leave the two roles on different devices: Windows' own
+        // settings would show one device and the widget another.
+        if console != multimedia {
+            if let Some(old) = &previous {
+                let _ = set(policy, PCWSTR(old.as_ptr()), 0);
+                let _ = set(policy, PCWSTR(old.as_ptr()), 1);
+            }
+        }
         release(policy);
-        ok
+        console && multimedia
     }
 }

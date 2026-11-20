@@ -1,15 +1,18 @@
 //! Taskbar Media: a now-playing widget that sits on the Windows taskbar, just
 //! left of the notification area / clock.
 //!
-//! Settings gear, album art (click to open the player), previous / play-pause
-//! / next, then title and artist over a seek bar. Works with anything that
-//! reports to Windows' media controls: Spotify, browsers, Media Player...
+//! By default: player switcher, album art (click to open the player),
+//! shuffle, previous / play-pause / next, repeat, title and artist over a
+//! seek bar, and a volume button. Every item can be hidden or reordered.
+//! Works with anything that reports to Windows' media controls: Spotify,
+//! browsers, Media Player...
 //!
 //! One widget window is created per taskbar it should appear on. A hidden
 //! controller window owns the timer and receives updates from the media
 //! worker thread.
 
-#![windows_subsystem = "windows"]
+// (Tests are ordinary console programs.)
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod config;
 mod crash;
@@ -45,14 +48,17 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::Foundation::WAIT_TIMEOUT;
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SendInput, SetCapture, TrackMouseEvent, INPUT, INPUT_0,
     INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT,
-    VK_ESCAPE, VK_SHIFT, VK_VOLUME_DOWN, VK_VOLUME_UP,
+    VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    VK_VOLUME_DOWN, VK_VOLUME_UP,
 };
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, ShellExecuteW, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
@@ -64,6 +70,10 @@ use media::{Cmd, Snapshot};
 use render::{ArtCache, Card, Frame, Hit, Layout, LayoutParams};
 
 const WM_APP_UPDATE: u32 = WM_APP + 1;
+/// Sent by a second launch of the exe: show the settings window.
+const WM_APP_SHOW: u32 = WM_APP + 3;
+/// A settings change was saved while the app state was busy: reload it.
+const WM_APP_RELOAD: u32 = WM_APP + 4;
 const TIMER_ID: usize = 1;
 const TICK_MS: u32 = 200;
 /// Fast timer that only runs while a title is scrolling.
@@ -71,6 +81,9 @@ const ANIM_TIMER_ID: usize = 2;
 const ANIM_MS: u32 = 33;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WIDGET_CLASS: PCWSTR = w!("TaskbarMediaWidget");
+
+/// A fault to cause on purpose, for testing: 1 crash, 2 hang (0 none).
+static TEST_FAULT: AtomicU32 = AtomicU32::new(0);
 
 /// The controller window, which the media worker posts updates to.
 static CONTROLLER_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -102,26 +115,64 @@ pub fn save_pictures() -> Option<(std::path::PathBuf, usize)> {
 }
 
 /// A picture of the widget for the settings window (see `App::preview`).
-pub fn preview(max_w: i32, other_taskbars: bool) -> Option<(Vec<u32>, i32, i32, u32)> {
-    with_app(|a| a.preview(max_w, other_taskbars)).flatten()
+pub fn preview(max_w: i32, max_h: i32, other_taskbars: bool) -> Option<(Vec<u32>, i32, i32, u32)> {
+    with_app(|a| a.preview(max_w, max_h, other_taskbars)).flatten()
 }
 
 /// Re-read every setting from the registry and apply it (after an import or
 /// a reset).
 pub fn reload_config() {
-    with_app(|a| {
+    let done = with_app(|a| {
         a.cfg = Config::load();
         a.apply_config();
     });
+    // The app state was busy: do it as soon as it is free.
+    if done.is_none() {
+        post_to_controller(WM_APP_RELOAD, 1);
+    }
+}
+
+thread_local! {
+    /// Settings changes waiting to be applied (see `update_config`).
+    static PENDING: RefCell<Vec<Box<dyn FnOnce(&mut Config)>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn post_to_controller(msg: u32, wparam: usize) {
+    let raw = CONTROLLER_HWND.load(Ordering::Relaxed);
+    if raw != 0 {
+        unsafe {
+            let _ = PostMessageW(Some(HWND(raw as *mut _)), msg, WPARAM(wparam), LPARAM(0));
+        }
+    }
 }
 
 /// Change settings, save them, and apply them straight away.
-pub fn update_config(f: impl FnOnce(&mut Config)) {
+///
+/// If the app state is busy (this was reached from inside one of its own
+/// calls), the change waits its turn and is applied, in order with any
+/// others, as soon as the state is free; it is never dropped and never
+/// applied to a stale copy of the settings.
+pub fn update_config(f: impl FnOnce(&mut Config) + 'static) {
+    PENDING.with(|p| p.borrow_mut().push(Box::new(f)));
+    if !apply_pending() {
+        post_to_controller(WM_APP_RELOAD, 0);
+    }
+}
+
+/// Apply waiting settings changes. False if the app state was busy.
+fn apply_pending() -> bool {
     with_app(|a| {
-        f(&mut a.cfg);
+        let changes = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        if changes.is_empty() {
+            return;
+        }
+        for change in changes {
+            change(&mut a.cfg);
+        }
         a.cfg.save();
         a.apply_config();
-    });
+    })
+    .is_some()
 }
 
 struct SeekOverride {
@@ -190,6 +241,8 @@ struct App {
     system_light: bool,
     /// The Windows accent color, 0xAARRGGBB.
     system_accent: u32,
+    /// Windows is set to show that color on the taskbar.
+    accent_taskbar: bool,
     ticks: u32,
     seek_override: Option<SeekOverride>,
     /// Volume level to show for a moment after the wheel changed it.
@@ -221,6 +274,18 @@ struct App {
     mixer_was_active: bool,
     /// Since when the mouse has been away from it and the widget.
     mixer_away: Option<Instant>,
+    /// The menu or device row the mouse button went down on.
+    popup_pressed: Option<usize>,
+    /// The interval the main timer is running at, in milliseconds.
+    tick_ms: u32,
+    /// Where the popup window was last put: (x, y, width, height).
+    popup_rect: Option<(i32, i32, i32, i32)>,
+    /// How many rows the open popup had no room for.
+    popup_more: usize,
+    /// Wheel movement not yet used up (a notch is 120), for the widget and
+    /// for the mixer popup.
+    wheel_acc: i32,
+    mixer_wheel_acc: i32,
     /// Message to show for a moment in place of the title.
     notice: Option<(String, Instant)>,
     /// The current audio output, while the output button is on the widget.
@@ -363,7 +428,10 @@ fn volume_step(up: bool) {
 
 /// Where a too-long title is in its scroll cycle: wait, scroll to the end,
 /// wait, scroll back.
-fn marquee_offset(overflow: f32, elapsed: f32, speed: f32) -> i32 {
+fn marquee_offset(overflow: f32, elapsed: f32, speed: f32) -> f32 {
+    if overflow <= 0.0 || speed <= 0.0 {
+        return 0.0;
+    }
     const HOLD_START: f32 = 2.5;
     const HOLD_END: f32 = 1.8;
     let travel = overflow / speed;
@@ -377,7 +445,7 @@ fn marquee_offset(overflow: f32, elapsed: f32, speed: f32) -> i32 {
     } else {
         1.0 - (t - HOLD_START - travel - HOLD_END) / travel
     };
-    (fraction * overflow).round() as i32
+    fraction.clamp(0.0, 1.0) * overflow
 }
 
 fn monitor_device(hwnd: HWND) -> String {
@@ -460,18 +528,33 @@ fn fullscreen_over(tb: &Taskbar) -> bool {
         // the window showing there is not the taskbar but one that fills the
         // whole monitor, the taskbar is covered. This catches browser video,
         // which the shell does not report as full-screen.
+        //
+        // Two spots are tried, because the widget itself may be sitting on
+        // the first (it can be nudged to the right, over the clock): just
+        // inside the clock area, and the taskbar's far right corner.
         let scale = tb.dpi as f32 / 96.0;
-        let probe = POINT {
-            x: (tb.anchor + (12.0 * scale) as i32).min(tb.rect.right - 3).max(tb.rect.left),
-            y: (tb.rect.top + tb.rect.bottom) / 2,
-        };
-        let at_probe = GetAncestor(WindowFromPoint(probe), GA_ROOT);
-        if !at_probe.is_invalid()
-            && at_probe != tb.hwnd
-            && !is_shell_or_own_window(at_probe)
-            && covers_monitor(at_probe, tb.hwnd)
-        {
-            return true;
+        let y = (tb.rect.top + tb.rect.bottom) / 2;
+        let spots = [
+            (tb.anchor + (12.0 * scale) as i32).min(tb.rect.right - 3).max(tb.rect.left),
+            tb.rect.right - 3,
+        ];
+        for x in spots {
+            let at_probe = GetAncestor(WindowFromPoint(POINT { x, y }), GA_ROOT);
+            if at_probe.is_invalid() {
+                continue;
+            }
+            if at_probe == tb.hwnd {
+                // The taskbar itself is showing there: not covered.
+                break;
+            }
+            if is_shell_or_own_window(at_probe) {
+                // Our own widget or popup (or the desktop): look elsewhere.
+                continue;
+            }
+            if covers_monitor(at_probe, tb.hwnd) {
+                return true;
+            }
+            break;
         }
 
         // And what the shell itself reports (exclusive full-screen games).
@@ -502,6 +585,72 @@ fn taskbar_in_front(widget: HWND, taskbar: HWND) -> bool {
         }
         false
     }
+}
+
+/// A layout cut down to the album art and the three transport buttons (those
+/// of them it had), for when the taskbar is nearly full.
+fn essentials(order: &[u8; config::ITEM_COUNT]) -> [u8; config::ITEM_COUNT] {
+    let keep = [config::ITEM_ART, config::ITEM_PREV, config::ITEM_PLAY, config::ITEM_NEXT];
+    let mut out = [0u8; config::ITEM_COUNT];
+    let mut n = 0;
+    for item in order.iter().filter(|item| keep.contains(item)) {
+        out[n] = *item;
+        n += 1;
+    }
+    // The same stand-in the layout itself uses when nothing can be shown.
+    if n == 0 {
+        out[0] = config::ITEM_ART;
+    }
+    out
+}
+
+/// Which text goes where: (the title row's main text, dimmer text after it
+/// on the same row, the second row's text when it has no seek bar).
+///
+/// `text_layout`: 0 "Title · Artist", 1 title then artist below, 2 "Artist ·
+/// Title", 3 title over artist, 4 title over album. `has_timeline`: the
+/// second row is taken by the seek bar. `has_row1` / `has_row2`: the widget
+/// has a title row / a second row at all. Whatever the combination, the
+/// title is shown somewhere and nothing is put where there is no row.
+fn text_lines(
+    text_layout: u32,
+    title: String,
+    artist: String,
+    album: String,
+    has_timeline: bool,
+    has_row1: bool,
+    has_row2: bool,
+) -> (String, String, String) {
+    let (mut line1, mut inline, mut below) = match text_layout {
+        1 => (title, String::new(), artist),
+        2 if !artist.is_empty() => (artist, title, String::new()),
+        2 => (title, String::new(), String::new()),
+        3 => (title, String::new(), artist),
+        4 if !album.is_empty() => (title, String::new(), album),
+        4 => (title, String::new(), artist),
+        // "Title · Artist" needs the seek bar row; without one the artist
+        // drops to the second row.
+        _ if has_timeline => (title, artist, String::new()),
+        _ => (title, String::new(), artist),
+    };
+    let free_row2 = has_row2 && !has_timeline;
+    if !has_row1 {
+        // Only a second row (the "Seek bar on its own" item without a
+        // timeline to show): everything goes there, on one line.
+        let all: Vec<String> = [line1, inline, below].into_iter().filter(|t| !t.is_empty()).collect();
+        return (String::new(), String::new(), if free_row2 { all.join(" \u{00B7} ") } else { String::new() });
+    }
+    if !free_row2 && inline.is_empty() {
+        // No room underneath: the second line follows the title.
+        inline = std::mem::take(&mut below);
+    } else if free_row2 && below.is_empty() {
+        // Room underneath and nothing in it: the trailing text moves down.
+        below = std::mem::take(&mut inline);
+    }
+    if line1.is_empty() && !inline.is_empty() {
+        line1 = std::mem::take(&mut inline);
+    }
+    (line1, inline, below)
 }
 
 fn filetime_now() -> i64 {
@@ -618,11 +767,14 @@ impl App {
 
     fn pull_snapshot(&mut self) {
         let Ok(guard) = self.shared.lock() else { return };
+        let before = (std::mem::take(&mut self.snap.app_id), std::mem::take(&mut self.snap.title));
         self.snap = guard.clone();
         drop(guard);
-        // Once the player reports a fresh position, trust it over our guess.
+        // Once the player reports a fresh position, trust it over our guess;
+        // and a guess made for one track means nothing for the next.
         if let Some(o) = &self.seek_override {
-            if self.snap.last_updated != o.last_updated_then {
+            let same_track = before.0 == self.snap.app_id && before.1 == self.snap.title;
+            if self.snap.last_updated != o.last_updated_then || !same_track {
                 self.seek_override = None;
             }
         }
@@ -648,8 +800,8 @@ impl App {
                 self.tray_shown = false;
             }
         } else if !self.tray_shown || force {
-            tray::add(self.controller, self.module, &tip);
-            self.tray_shown = true;
+            // If Windows is not ready for it yet, `tick` tries again.
+            self.tray_shown = tray::add(self.controller, self.module, &tip);
             self.tray_tip = tip;
         } else if tip != self.tray_tip {
             tray::update_tip(self.controller, &tip);
@@ -724,6 +876,15 @@ impl App {
     /// Keep one widget per wanted taskbar, positioned and painted.
     fn tick(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks == 25 {
+            match TEST_FAULT.load(Ordering::Relaxed) {
+                1 => panic!("test crash (TASKBARMEDIA_TEST=crash)"),
+                2 => loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                },
+                _ => {}
+            }
+        }
         if self.ticks % 10 == 1 {
             self.system_light = config::system_light_theme();
             // The output can change behind our back (a headset is plugged
@@ -734,6 +895,7 @@ impl App {
                 None
             };
             self.system_accent = config::system_accent().unwrap_or(0xFF4C_C2FF);
+            self.accent_taskbar = config::accent_on_taskbar();
         }
         if self.seek_override.as_ref().is_some_and(|o| o.at.elapsed() > Duration::from_secs(3)) {
             self.seek_override = None;
@@ -742,6 +904,10 @@ impl App {
         // mixer, the keyboard), so re-read it about once a second.
         if self.ticks % 5 == 1 {
             self.refresh_volume();
+        }
+        // The tray icon could not be added earlier (Explorer still starting).
+        if self.cfg.tray_icon && !self.tray_shown && self.ticks % 15 == 0 {
+            self.sync_tray(false);
         }
         self.tick_mixer();
         if self.volume_flash.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_millis(1500)) {
@@ -805,26 +971,53 @@ impl App {
 
             // The space between the last app button and the tray, if known
             // (Windows 11; on Windows 10 space is reserved further down).
+            // Buttons that already reach under where the widget ends leave
+            // no room at all (the widget then takes its smallest form). A
+            // "last button" at or past the tray is a bad measurement.
             let room = measured
                 .apps_right
-                .filter(|x| self.cfg.avoid_apps && *x > tb.rect.left && *x < right)
-                .map(|x| (right - x) as f32 - 8.0 * scale);
+                .filter(|x| self.cfg.avoid_apps && *x > tb.rect.left && *x < anchor)
+                .map(|x| ((right - x) as f32 - 8.0 * scale).max(0.0));
 
             // Use the chosen width, or the widest smaller one that fits.
             let base = self.layout_params(tb_h, scale, tb.primary);
             let mut params = base;
             let mut layout = Layout::new(&params);
             if let Some(room) = room {
-                let mut width = self.cfg.width;
+                // Narrower text first, then tighter and smaller buttons,
+                // then the album-art-and-buttons form, and as a last resort
+                // that form with only the essentials.
+                let mut step = 0;
                 while layout.width > room {
-                    if width > 0 {
-                        width -= 1;
-                        params = LayoutParams { width, ..base };
-                    } else if !params.mini {
-                        params = LayoutParams { width: 0, mini: true, ..base };
-                    } else {
-                        break;
-                    }
+                    step += 1;
+                    params = match step {
+                        1 if base.width > 1 => LayoutParams { width: 1, ..base },
+                        1 | 2 if base.width > 0 => {
+                            step = 2;
+                            LayoutParams { width: 0, ..base }
+                        }
+                        1..=3 if base.gap > 0 => {
+                            step = 3;
+                            LayoutParams { width: 0, gap: 0, ..base }
+                        }
+                        1..=4 if base.button_size > 0 => {
+                            step = 4;
+                            LayoutParams { width: 0, gap: 0, button_size: 0, ..base }
+                        }
+                        1..=5 => {
+                            step = 5;
+                            LayoutParams { width: 0, gap: 0, button_size: 0, mini: true, ..base }
+                        }
+                        6 => LayoutParams {
+                            width: 0,
+                            gap: 0,
+                            button_size: 0,
+                            mini: true,
+                            order: essentials(&base.order),
+                            ..base
+                        },
+                        _ => break,
+                    };
                     layout = Layout::new(&params);
                 }
             }
@@ -873,6 +1066,17 @@ impl App {
                 }
             }
         }
+        // Measuring the Windows 11 taskbar is costly; only while it matters.
+        // It serves two purposes: finding the app buttons to keep clear of,
+        // and finding the clock on taskbars that have no window for it
+        // (Windows 11's taskbars on other displays). It runs for as long as
+        // a track is there to show, not only while the widget is visible,
+        // so that the answer is fresh the moment the widget comes back.
+        let unanchored = bars.iter().any(|b| !b.anchor_exact);
+        probe::WANTED.store(
+            !self.can_reserve && showable && (self.cfg.avoid_apps || unanchored),
+            Ordering::Relaxed,
+        );
         if self.can_reserve && !reserved {
             if let Some(main) = bars.iter().find(|b| b.primary) {
                 reserve::restore(main.hwnd);
@@ -882,6 +1086,18 @@ impl App {
         }
 
         self.update_card();
+
+        // With nothing to show and nothing open there is little to keep up
+        // with (new tracks arrive as messages, not through this timer), so
+        // tick at a fifth of the rate and let the processor sleep.
+        let busy = showable || self.mixer_open || !settings::hwnd().is_invalid();
+        let wanted_ms = if busy { TICK_MS } else { TICK_MS * 5 };
+        if wanted_ms != self.tick_ms {
+            self.tick_ms = wanted_ms;
+            unsafe {
+                SetTimer(Some(self.controller), TIMER_ID, wanted_ms, None);
+            }
+        }
 
         // Run the fast timer only while some visible title needs to scroll.
         let scrolling = self.cfg.scroll_titles
@@ -960,11 +1176,17 @@ impl App {
             Some(w) => (pt.x, w.rect.1, w.rect.1 + w.rect.3),
             None => (pt.x, pt.y - 10, pt.y + 10),
         };
-        let scale = widget
-            .or(self.widgets.first())
-            .map(|w| w.params.scale)
-            .filter(|s| *s > 0.0)
-            .unwrap_or_else(|| unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96) as f32 / 96.0);
+        // From the tray the menu belongs to the monitor the mouse is on,
+        // which may be scaled differently from the widget's.
+        let scale = widget.map(|w| w.params.scale).filter(|s| *s > 0.0).unwrap_or_else(|| unsafe {
+            let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let (mut dx, mut dy) = (0u32, 0u32);
+            let dpi = match GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) {
+                Ok(()) if dx > 0 => dx,
+                _ => windows::Win32::UI::HiDpi::GetDpiForSystem(),
+            };
+            dpi.max(96) as f32 / 96.0
+        });
         self.open_popup(Popup::Menu, anchor, scale.max(0.5));
     }
 
@@ -989,7 +1211,7 @@ impl App {
             let preferred = media::preferred();
             rows.push(MenuRow { kind: 1, ..item("PLAYER", MenuCmd::None) });
             rows.push(MenuRow { tick: preferred.is_none(), ..item("Automatic", MenuCmd::Auto) });
-            for id in self.snap.sessions.iter().take(12) {
+            for id in self.snap.sessions.iter().take(24) {
                 rows.push(MenuRow {
                     tick: preferred.as_ref() == Some(id),
                     ..item(&launch::display_name(id), MenuCmd::Player(id.clone()))
@@ -1016,11 +1238,22 @@ impl App {
             Popup::Outputs => {
                 self.load_outputs();
                 if self.outputs_rows.is_empty() {
+                    // Say why nothing opened.
+                    self.notice = Some(("No output devices found".to_string(), Instant::now()));
+                    for j in 0..self.widgets.len() {
+                        if self.widgets[j].visible {
+                            self.repaint(j);
+                        }
+                    }
                     return;
                 }
             }
             Popup::Menu => self.menu_rows = self.build_menu(),
         }
+        self.popup_more = 0;
+        self.trim_popup_rows();
+        self.popup_pressed = None;
+        self.mixer_wheel_acc = 0;
         self.outputs_hover = None;
         self.outputs_frame = None;
         self.menu_hover = None;
@@ -1040,11 +1273,86 @@ impl App {
         }
     }
 
+    /// How tall a popup hanging from the current anchor may be: the larger
+    /// of the space above it and the space below it on its monitor.
+    fn popup_room(&self) -> i32 {
+        let (cx, top, bottom) = self.mixer_anchor;
+        let gap = (8.0 * self.mixer_scale) as i32;
+        unsafe {
+            let monitor = MonitorFromPoint(POINT { x: cx, y: top }, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                return i32::MAX;
+            }
+            let m = mi.rcMonitor;
+            ((top - m.top).max(m.bottom - bottom) - 2 * gap).max(1)
+        }
+    }
+
+    /// Leave out rows a popup has no room for, so that it never runs off
+    /// the screen: the last apps of the mixer, the last devices that are
+    /// not the current one, the last players of the menu.
+    fn trim_popup_rows(&mut self) {
+        let room = self.popup_room();
+        let scale = self.mixer_scale;
+        // The mixer and the device list say how many rows were left out, on
+        // a line at the bottom (which itself needs room).
+        let mut more = 0;
+        match self.popup {
+            Popup::Mixer => {
+                while self.mixer_rows.len() > 2
+                    && render::mixer_layout(scale, self.mixer_rows.len(), more > 0).h > room
+                {
+                    self.mixer_rows.pop();
+                    more += 1;
+                }
+            }
+            Popup::Outputs => {
+                while self.outputs_rows.len() > 2
+                    && render::picker_layout(scale, self.outputs_rows.len(), more > 0).1 > room
+                {
+                    let current = &self.outputs_current;
+                    match self.outputs_rows.iter().rposition(|d| d.id != *current) {
+                        Some(at) => {
+                            self.outputs_rows.remove(at);
+                            more += 1;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            Popup::Menu => loop {
+                let kinds: Vec<u8> = self.menu_rows.iter().map(|r| r.kind).collect();
+                if render::menu_layout(scale, &kinds).1 <= room {
+                    break;
+                }
+                let unticked_player =
+                    |r: &MenuRow| matches!(r.cmd, MenuCmd::Player(_)) && !r.tick;
+                match self.menu_rows.iter().rposition(unticked_player) {
+                    Some(at) => {
+                        self.menu_rows.remove(at);
+                    }
+                    None => break,
+                }
+            },
+        }
+        self.popup_more = more;
+    }
+
     fn close_mixer(&mut self) {
         if !self.mixer_open {
             return;
         }
         self.mixer_open = false;
+        // A slider may be mid-drag (Esc, or focus taken away): let go of the
+        // mouse, or its next movement would bring the popup back.
+        if self.mixer_drag.is_some() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
+        self.popup_pressed = None;
+        self.popup_rect = None;
         self.mixer_drag = None;
         self.mixer_frame = None;
         self.outputs_frame = None;
@@ -1060,14 +1368,15 @@ impl App {
         }
     }
 
-    /// Draw the mixer if anything changed, and keep it placed above (or,
-    /// for a taskbar at the top, below) the volume button.
     /// The highlight color the popups use (0 means the text color).
     fn popup_accent(&self) -> u32 {
+        // Adjusted, like the widget's, to stand out from what it is on:
+        // here the popup's own light or dark panel.
+        let panel = if self.system_light { 0x00F3_F3F3 } else { 0x002B_2B2B };
         match self.cfg.accent_mode {
             2 => 0,
-            3 => self.cfg.accent_rgb,
-            _ => self.system_accent,
+            3 => render::readable(self.cfg.accent_rgb, panel),
+            _ => render::readable(self.system_accent, panel),
         }
     }
 
@@ -1088,6 +1397,7 @@ impl App {
                     muted: r.muted,
                 })
                 .collect(),
+            more: self.popup_more,
             hover_row: self.mixer_hover.map_or(-1, |(row, _)| row as i32),
             hover_icon: self.mixer_hover.is_some_and(|(_, part)| part == MixerPart::Icon),
             drag_row: self.mixer_drag.map_or(-1, |row| row as i32),
@@ -1111,6 +1421,7 @@ impl App {
                     current: d.id == self.outputs_current,
                 })
                 .collect(),
+            more: self.popup_more,
             hover_row: self.outputs_hover.map_or(-1, |row| row as i32),
         }
     }
@@ -1196,6 +1507,7 @@ impl App {
         // The popups, each on a plain backdrop. Their contents are loaded
         // fresh and the popup's own state is put back afterwards.
         let keep = (self.mixer_scale, self.mixer_hover, self.outputs_hover, self.menu_hover);
+        let keep_more = std::mem::take(&mut self.popup_more);
         let rows = (
             std::mem::take(&mut self.mixer_rows),
             std::mem::take(&mut self.outputs_rows),
@@ -1223,19 +1535,24 @@ impl App {
         }
 
         (self.mixer_scale, self.mixer_hover, self.outputs_hover, self.menu_hover) = keep;
+        self.popup_more = keep_more;
         (self.mixer_rows, self.outputs_rows, self.menu_rows, self.outputs_current) = rows;
         saved
     }
 
+    /// Draw the popup if anything changed, and keep it placed above (or,
+    /// for a taskbar at the top, below) what it hangs from.
     fn show_mixer(&mut self) {
-        let frame = self.mixer_picture();
-        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
-        let picker = self.outputs_picture();
-        let menu = self.menu_picture();
+        if !self.mixer_open {
+            return;
+        }
         let (w, h) = match self.popup {
-            Popup::Mixer => (layout.w, layout.h),
+            Popup::Mixer => {
+                let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len(), self.popup_more > 0);
+                (layout.w, layout.h)
+            }
             Popup::Outputs => {
-                let (w, h, _) = render::picker_layout(self.mixer_scale, self.outputs_rows.len());
+                let (w, h, _) = render::picker_layout(self.mixer_scale, self.outputs_rows.len(), self.popup_more > 0);
                 (w, h)
             }
             Popup::Menu => {
@@ -1252,35 +1569,61 @@ impl App {
             let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
             if GetMonitorInfoW(monitor, &mut mi).as_bool() {
                 let m = mi.rcMonitor;
+                // Above if it fits there, else below if it fits there, else
+                // as high as it can go while staying on the screen.
                 if y < m.top {
-                    y = bottom + gap;
+                    let below = bottom + gap;
+                    y = if below + h <= m.bottom { below } else { m.top.max(m.bottom - h).min(below) };
                 }
                 x = x.min(m.right - w - gap).max(m.left + gap);
             }
-            match self.popup {
-                Popup::Mixer if self.mixer_frame.as_ref() != Some(&frame) => {
-                    render::paint_mixer(self.mixer, &frame);
-                    self.mixer_frame = Some(frame);
-                }
-                Popup::Outputs if self.outputs_frame.as_ref() != Some(&picker) => {
-                    render::paint_picker(self.mixer, &picker);
-                    self.outputs_frame = Some(picker);
-                }
-                Popup::Menu if self.menu_frame.as_ref() != Some(&menu) => {
-                    render::paint_menu(self.mixer, &menu);
-                    self.menu_frame = Some(menu);
-                }
-                _ => {}
+            // A new picture goes up at its new place in one step, so that a
+            // popup changing size never shows for a moment where the old
+            // one was.
+            let rect = (x, y, w, h);
+            let moved = self.popup_rect != Some(rect);
+            if moved {
+                render::place_next(x, y);
             }
-            let _ = SetWindowPos(
-                self.mixer,
-                Some(HWND_TOPMOST),
-                x,
-                y,
-                w,
-                h,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
+            match self.popup {
+                Popup::Mixer => {
+                    let frame = self.mixer_picture();
+                    if moved || self.mixer_frame.as_ref() != Some(&frame) {
+                        render::paint_mixer(self.mixer, &frame);
+                        self.mixer_frame = Some(frame);
+                    }
+                }
+                Popup::Outputs => {
+                    let picker = self.outputs_picture();
+                    if moved || self.outputs_frame.as_ref() != Some(&picker) {
+                        render::paint_picker(self.mixer, &picker);
+                        self.outputs_frame = Some(picker);
+                    }
+                }
+                Popup::Menu => {
+                    let menu = self.menu_picture();
+                    if moved || self.menu_frame.as_ref() != Some(&menu) {
+                        render::paint_menu(self.mixer, &menu);
+                        self.menu_frame = Some(menu);
+                    }
+                }
+            }
+            render::place_next_clear();
+            // Only when something changed: moving a window (even to where
+            // it is) makes Windows send it a mouse move, which would pull
+            // the keyboard's highlight back to the row under the mouse.
+            if moved {
+                let _ = SetWindowPos(
+                    self.mixer,
+                    Some(HWND_TOPMOST),
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+                self.popup_rect = Some(rect);
+            }
         }
     }
 
@@ -1320,17 +1663,35 @@ impl App {
         match self.popup {
             // Apps start and stop, and volumes change elsewhere.
             Popup::Mixer if self.mixer_drag.is_none() && self.ticks % 2 == 0 => {
+                // Rows can move when an app appears or goes: keep the
+                // highlight on the same app, not the same position.
+                let hovered = self.mixer_hover.and_then(|(row, part)| {
+                    self.mixer_rows.get(row).map(|r| (r.key.clone(), part))
+                });
                 self.mixer_rows = Self::load_mixer_rows();
+                self.trim_popup_rows();
+                self.mixer_hover = hovered.and_then(|(key, part)| {
+                    self.mixer_rows.iter().position(|r| r.key == key).map(|row| (row, part))
+                });
             }
             // Devices get plugged in and unplugged.
-            Popup::Outputs if self.ticks % 5 == 0 => self.load_outputs(),
+            Popup::Outputs if self.ticks % 5 == 0 => {
+                let hovered = self.outputs_hover.and_then(|row| self.outputs_rows.get(row).map(|d| d.id.clone()));
+                self.load_outputs();
+                self.trim_popup_rows();
+                self.outputs_hover = hovered.and_then(|id| self.outputs_rows.iter().position(|d| d.id == id));
+                if self.outputs_rows.is_empty() {
+                    self.close_mixer();
+                    return;
+                }
+            }
             _ => {}
         }
         self.show_mixer();
     }
 
     fn mixer_hit(&self, x: i32, y: i32) -> Option<(usize, MixerPart)> {
-        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
+        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len(), self.popup_more > 0);
         let (x, y) = (x as f32, y as f32);
         let reach = 8.0 * self.mixer_scale;
         layout.rows.iter().enumerate().find_map(|(i, r)| {
@@ -1352,6 +1713,15 @@ impl App {
         let Some(entry) = self.mixer_rows.get_mut(row) else { return };
         // Moving the slider of something muted un-mutes it.
         let unmute = entry.muted && level > 0.0;
+        // A drag reports far more positions than there are volume steps;
+        // only talk to Windows when the level shown would change.
+        // (The two ends always go through, so that a drag to the very end
+        // really is silent, or full.)
+        let same_percent = (entry.level * 100.0).round() == (level * 100.0).round();
+        let at_an_end = (level == 0.0 || level == 1.0) && entry.level != level;
+        if !unmute && same_percent && !at_an_end {
+            return;
+        }
         entry.level = level;
         if unmute {
             entry.muted = false;
@@ -1371,13 +1741,13 @@ impl App {
     }
 
     fn mixer_level_at(&self, row: usize, x: i32) -> f32 {
-        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
+        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len(), self.popup_more > 0);
         layout.rows.get(row).map_or(0.0, |r| ((x as f32 - r.track.x) / r.track.w.max(1.0)).clamp(0.0, 1.0))
     }
 
     /// The output list row at a point in the popup.
     fn outputs_hit(&self, x: i32, y: i32) -> Option<usize> {
-        let (_, _, rows) = render::picker_layout(self.mixer_scale, self.outputs_rows.len());
+        let (_, _, rows) = render::picker_layout(self.mixer_scale, self.outputs_rows.len(), self.popup_more > 0);
         rows.iter().position(|r| r.contains(x as f32, y as f32))
     }
 
@@ -1388,9 +1758,11 @@ impl App {
         } else {
             "Could not switch output".to_string()
         };
-        if self.output.is_some() {
+        if self.cfg.shows(config::ITEM_OUTPUT) {
             self.output = devices::current();
         }
+        // The volume shown is the new device's from now on.
+        self.refresh_volume();
         self.notice = Some((message, Instant::now()));
     }
 
@@ -1407,7 +1779,17 @@ impl App {
     fn run_menu(&mut self, row: usize) -> Action {
         let Some(cmd) = self.menu_rows.get(row).map(|r| r.cmd.clone()) else { return Action::None };
         let (anchor, scale) = (self.mixer_anchor, self.mixer_scale);
-        self.close_mixer();
+        // The mixer and the device list take the menu's place in the same
+        // window, without hiding it in between (which would flash, and give
+        // the keyboard focus away).
+        let stays_open = match cmd {
+            MenuCmd::Mixer => true,
+            MenuCmd::Outputs => !devices::list().is_empty(),
+            _ => false,
+        };
+        if !stays_open {
+            self.close_mixer();
+        }
         match cmd {
             MenuCmd::None => Action::None,
             MenuCmd::Update => Action::Releases,
@@ -1446,7 +1828,101 @@ impl App {
         }
     }
 
+    /// Mute or unmute a mixer row.
+    fn mixer_toggle_mute(&mut self, row: usize) {
+        if let Some(entry) = self.mixer_rows.get_mut(row) {
+            entry.muted = !entry.muted;
+            let (key, mute) = (entry.key.clone(), entry.muted);
+            if key.is_empty() {
+                volume::set_mute("", true, mute);
+            } else {
+                volume::mixer_set_mute(&key, mute);
+            }
+        }
+    }
+
+    /// Keyboard control of the open popup: Up / Down (and Home / End) move
+    /// the highlight, Enter or Space chooses, and in the mixer Left / Right
+    /// change the volume and Space or M mutes.
+    fn popup_key(&mut self, vk: u16) -> Action {
+        if !self.mixer_open {
+            return Action::None;
+        }
+        // Move `current` through `count` rows, skipping rows `usable` rejects.
+        let step = |current: Option<usize>, count: usize, usable: &dyn Fn(usize) -> bool| -> Option<usize> {
+            if count == 0 {
+                return None;
+            }
+            let order: Vec<usize> = if vk == VK_UP.0 || vk == VK_END.0 {
+                (0..count).rev().collect()
+            } else {
+                (0..count).collect()
+            };
+            let from_edge = vk == VK_HOME.0 || vk == VK_END.0 || current.is_none();
+            let start = match current {
+                Some(at) if !from_edge => order.iter().position(|i| *i == at).map_or(0, |p| p + 1),
+                _ => 0,
+            };
+            order.iter().cycle().skip(start).take(count).copied().find(|i| usable(*i))
+        };
+        let moving = vk == VK_UP.0 || vk == VK_DOWN.0 || vk == VK_HOME.0 || vk == VK_END.0;
+        let choosing = vk == VK_RETURN.0 || vk == VK_SPACE.0;
+        let mut action = Action::None;
+        match self.popup {
+            Popup::Menu => {
+                if moving {
+                    let rows = &self.menu_rows;
+                    self.menu_hover = step(self.menu_hover, rows.len(), &|i| rows[i].kind == 0);
+                } else if choosing {
+                    if let Some(row) = self.menu_hover {
+                        return self.run_menu(row);
+                    }
+                }
+            }
+            Popup::Outputs => {
+                if moving {
+                    self.outputs_hover = step(self.outputs_hover, self.outputs_rows.len(), &|_| true);
+                } else if choosing {
+                    if let Some(device) = self.outputs_hover.and_then(|row| self.outputs_rows.get(row).cloned()) {
+                        self.apply_output(&device);
+                        self.close_mixer();
+                        self.tick();
+                        return action;
+                    }
+                }
+            }
+            Popup::Mixer => {
+                let row = self.mixer_hover.map(|(row, _)| row);
+                if moving {
+                    self.mixer_hover =
+                        step(row, self.mixer_rows.len(), &|_| true).map(|row| (row, MixerPart::Slider));
+                } else if row.is_none() && (vk == VK_LEFT.0 || vk == VK_RIGHT.0) && !self.mixer_rows.is_empty() {
+                    // Nothing highlighted yet: start on the first row (the
+                    // system volume); the next press changes it.
+                    self.mixer_hover = Some((0, MixerPart::Slider));
+                } else if let Some(row) = row.filter(|row| *row < self.mixer_rows.len()) {
+                    if vk == VK_LEFT.0 || vk == VK_RIGHT.0 {
+                        let change = if vk == VK_RIGHT.0 { 0.02 } else { -0.02 };
+                        let level = self.mixer_rows[row].level + change;
+                        self.mixer_set_level(row, level);
+                    } else if vk == VK_SPACE.0 || vk == b'M' as u16 {
+                        self.mixer_toggle_mute(row);
+                    }
+                }
+            }
+        }
+        if vk == VK_ESCAPE.0 {
+            self.close_mixer();
+            action = Action::None;
+        }
+        self.show_mixer();
+        action
+    }
+
     fn mixer_mouse_move(&mut self, x: i32, y: i32) {
+        if !self.mixer_open {
+            return;
+        }
         if self.popup == Popup::Menu {
             self.menu_hover = self.menu_hit(x, y);
             self.show_mixer();
@@ -1468,19 +1944,18 @@ impl App {
     }
 
     fn mixer_mouse_down(&mut self, x: i32, y: i32) -> Action {
+        if !self.mixer_open {
+            return Action::None;
+        }
+        // Menu and device rows act when the button is let go on the row it
+        // went down on, as ordinary menus do: sliding off cancels, and the
+        // release cannot land on whatever is underneath the popup.
         if self.popup == Popup::Menu {
-            return match self.menu_hit(x, y) {
-                Some(row) => self.run_menu(row),
-                None => Action::None,
-            };
+            self.popup_pressed = self.menu_hit(x, y);
+            return Action::None;
         }
         if self.popup == Popup::Outputs {
-            // Choosing a device switches to it and closes the list.
-            if let Some(device) = self.outputs_hit(x, y).and_then(|row| self.outputs_rows.get(row).cloned()) {
-                self.apply_output(&device);
-                self.close_mixer();
-                self.tick();
-            }
+            self.popup_pressed = self.outputs_hit(x, y);
             return Action::None;
         }
         match self.mixer_hit(x, y) {
@@ -1492,41 +1967,60 @@ impl App {
                 let level = self.mixer_level_at(row, x);
                 self.mixer_set_level(row, level);
             }
-            Some((row, MixerPart::Icon)) => {
-                if let Some(entry) = self.mixer_rows.get_mut(row) {
-                    entry.muted = !entry.muted;
-                    let (key, mute) = (entry.key.clone(), entry.muted);
-                    if key.is_empty() {
-                        volume::set_mute("", true, mute);
-                    } else {
-                        volume::mixer_set_mute(&key, mute);
-                    }
-                }
-            }
+            Some((row, MixerPart::Icon)) => self.mixer_toggle_mute(row),
             None => {}
         }
         self.show_mixer();
         Action::None
     }
 
-    fn mixer_mouse_up(&mut self) {
-        if self.mixer_drag.take().is_some() {
-            unsafe {
-                let _ = ReleaseCapture();
-            }
-            self.show_mixer();
+    fn mixer_mouse_up(&mut self, x: i32, y: i32) -> Action {
+        if !self.mixer_open {
+            return Action::None;
         }
+        let pressed = self.popup_pressed.take();
+        match self.popup {
+            Popup::Menu => {
+                if let Some(row) = pressed.filter(|row| self.menu_hit(x, y) == Some(*row)) {
+                    return self.run_menu(row);
+                }
+            }
+            Popup::Outputs => {
+                // Choosing a device switches to it and closes the list.
+                let row = pressed.filter(|row| self.outputs_hit(x, y) == Some(*row));
+                if let Some(device) = row.and_then(|row| self.outputs_rows.get(row).cloned()) {
+                    self.apply_output(&device);
+                    self.close_mixer();
+                    self.tick();
+                }
+            }
+            Popup::Mixer => {
+                if self.mixer_drag.take().is_some() {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    self.show_mixer();
+                }
+            }
+        }
+        Action::None
     }
 
-    /// Wheel over a row: 4% per notch.
-    fn mixer_wheel(&mut self, x: i32, y: i32, up: bool) {
-        if self.popup != Popup::Mixer {
+    /// Wheel over a row: 4% per notch. `delta` is the raw wheel movement;
+    /// touchpads and free-spinning wheels send many small ones, which are
+    /// added up until they make a whole notch.
+    fn mixer_wheel(&mut self, x: i32, y: i32, delta: i32) {
+        if !self.mixer_open || self.popup != Popup::Mixer {
             return;
         }
-        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len());
+        let notches = take_notches(&mut self.mixer_wheel_acc, delta);
+        if notches == 0 {
+            return;
+        }
+        let layout = render::mixer_layout(self.mixer_scale, self.mixer_rows.len(), self.popup_more > 0);
         let row = layout.rows.iter().position(|r| r.row.contains(x as f32, y as f32));
         if let Some(row) = row {
-            let level = self.mixer_rows[row].level + if up { 0.04 } else { -0.04 };
+            let level = self.mixer_rows[row].level + 0.04 * notches as f32;
             self.mixer_set_level(row, level);
             self.show_mixer();
         }
@@ -1647,20 +2141,31 @@ impl App {
         let track_w = layout.track.w.max(1.0);
         let fill = (fraction * track_w).round() / track_w;
 
-        // Which text goes where, per the chosen text layout.
-        let (line1, inline, below) = match self.cfg.text_layout {
-            1 => (title, String::new(), artist),
-            2 if !artist.is_empty() => (artist, title, String::new()),
-            2 => (title, String::new(), String::new()),
-            3 => (title, String::new(), artist),
-            4 if !album.is_empty() => (title, String::new(), album),
-            4 => (title, String::new(), artist),
-            // "Title · Artist" needs the seek bar row; without one the
-            // artist drops to the second row.
-            _ if has_timeline => (title, artist, String::new()),
-            _ => (title, String::new(), artist),
-        };
+        let (line1, inline, below) = text_lines(
+            self.cfg.text_layout,
+            title,
+            artist,
+            album,
+            has_timeline,
+            layout.row1.w > 0.0,
+            layout.row2.w > 0.0,
+        );
         let (fg, light) = self.text_color();
+        // The volume read-out normally takes the seek bar's place; a widget
+        // without that row says it in words instead.
+        let mut notice = self.notice.as_ref().map(|(text, _)| text.clone());
+        if layout.row2.w <= 0.0 && notice.is_none() {
+            notice = self.volume_flash.as_ref().map(|(level, _)| format!("Volume {level}%"));
+        }
+        // What the highlight color has to stand out from: the taskbar,
+        // which takes the Windows accent color when that option is on.
+        let bar = if self.accent_taskbar {
+            self.system_accent & 0x00FF_FFFF
+        } else if self.system_light {
+            0x00EE_EEEE
+        } else {
+            0x0020_2020
+        };
 
         Frame {
             w,
@@ -1699,7 +2204,8 @@ impl App {
             background: self.cfg.background,
             font: self.cfg.font,
             volume: self.volume_flash.as_ref().map(|(level, _)| *level),
-            notice: self.notice.as_ref().map(|(text, _)| text.clone()),
+            notice,
+            bar,
             update: update::available().is_some(),
             headphones: self.output.as_ref().is_some_and(|d| d.headphones),
             vol: self.volume.map_or(if sample { 70 } else { 0 }, |(level, _)| (level * 100.0).round() as u8),
@@ -1734,8 +2240,10 @@ impl App {
 
     /// A picture of the widget for the settings window: opaque pixels, its
     /// width and height, and the taskbar-like color behind it. Scaled down
-    /// if it would be wider than `max_w`.
-    fn preview(&self, max_w: i32, other_taskbars: bool) -> Option<(Vec<u32>, i32, i32, u32)> {
+    /// if it would be wider than `max_w` or taller than `max_h` (a tall
+    /// taskbar, or a main display scaled up more than the one the settings
+    /// window is on).
+    fn preview(&self, max_w: i32, max_h: i32, other_taskbars: bool) -> Option<(Vec<u32>, i32, i32, u32)> {
         // Size it like the real thing on the main taskbar, when there is one.
         let real = self.widgets.iter().find(|w| w.primary && w.params.height > 0);
         let (mut height, mut scale) = match real {
@@ -1756,6 +2264,10 @@ impl App {
             let layout = Layout::new(&params);
             (params, layout)
         };
+        if height > max_h && max_h >= 16 {
+            scale *= max_h as f32 / height as f32;
+            height = max_h;
+        }
         let (mut params, mut layout) = build(height, scale);
         if layout.width > max_w as f32 && layout.width > 1.0 {
             let shrink = max_w as f32 / layout.width;
@@ -1780,16 +2292,21 @@ impl App {
         }
         // Title scrolling: restart the cycle whenever the text changes.
         let scroll = self.cfg.scroll_titles && !self.widgets[i].params.mini;
-        let key = format!("{}\u{1}{}", self.snap.title, self.snap.artist);
+        let notice = self.notice.as_ref().map_or("", |(text, _)| text.as_str());
+        let key = format!("{}\u{1}{}\u{1}{}", self.snap.title, self.snap.artist, notice);
         let widget = &mut self.widgets[i];
         if widget.scroll_key != key {
             widget.scroll_key = key;
             widget.scroll_start = Instant::now();
             widget.overflow = 0.0;
         }
+        // In steps of the enlarged picture the widget is drawn on, so slow
+        // scrolling glides by fractions of a pixel rather than jerking.
         let scroll_px = if scroll && widget.overflow > 0.0 {
             let speed = 28.0 * widget.params.scale.max(0.5);
-            marquee_offset(widget.overflow, widget.scroll_start.elapsed().as_secs_f32(), speed)
+            let k = render::supersample_factor(self.cfg.smooth, widget.params.scale);
+            let px = marquee_offset(widget.overflow, widget.scroll_start.elapsed().as_secs_f32(), speed);
+            (px * k as f32).round() as i32
         } else {
             0
         };
@@ -1904,7 +2421,11 @@ impl App {
                         // Step through the players, wrapping at the ends.
                         let ids = &self.snap.sessions;
                         if ids.len() > 1 {
-                            let at = ids.iter().position(|id| *id == self.snap.app_id).unwrap_or(0);
+                            // From the player last stepped to (the worker
+                            // may not have caught up with a quick second
+                            // click yet), else the one being shown.
+                            let from = media::preferred().unwrap_or_else(|| self.snap.app_id.clone());
+                            let at = ids.iter().position(|id| *id == from).unwrap_or(0);
                             let next = if hit == Hit::PlayerDown {
                                 (at + 1) % ids.len()
                             } else {
@@ -1990,11 +2511,36 @@ impl App {
 
     /// Shift + wheel: slide this taskbar's widget sideways.
     fn nudge(&mut self, i: usize, delta: i32) {
-        let slot = if self.widgets[i].primary { &mut self.cfg.offset } else { &mut self.cfg.offset2 };
+        let primary = self.widgets[i].primary;
+        let hwnd = self.widgets[i].hwnd;
+        let before_x = self.widgets[i].rect.0;
+        let slot = if primary { &mut self.cfg.offset } else { &mut self.cfg.offset2 };
+        let before = *slot;
         *slot = (*slot + delta).clamp(-4000, 4000);
-        self.cfg.save();
         self.tick();
+        // Against the end of the taskbar the widget cannot move further;
+        // do not let the offset run on, or coming back would take as many
+        // notches again before anything moved.
+        let moved = self.widgets.iter().find(|w| w.hwnd == hwnd).is_some_and(|w| w.rect.0 != before_x);
+        if !moved {
+            *(if primary { &mut self.cfg.offset } else { &mut self.cfg.offset2 }) = before;
+        }
+        self.cfg.save();
     }
+}
+
+/// Add wheel movement to `acc` and take out the whole notches (120 each)
+/// it now holds: positive for up, negative for down. Changing direction
+/// drops what was left over from the other way.
+fn take_notches(acc: &mut i32, delta: i32) -> i32 {
+    const NOTCH: i32 = 120;
+    if (*acc > 0 && delta < 0) || (*acc < 0 && delta > 0) {
+        *acc = 0;
+    }
+    *acc += delta;
+    let notches = *acc / NOTCH;
+    *acc -= notches * NOTCH;
+    notches.clamp(-8, 8)
 }
 
 /// Flip between the two output devices chosen in settings.
@@ -2115,26 +2661,38 @@ unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_MOUSEWHEEL => {
             // Shift + wheel nudges the widget; a plain wheel changes volume.
+            // Small movements (touchpads, smooth wheels) add up to notches.
             let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+            let notches = with_app(|a| take_notches(&mut a.wheel_acc, delta)).unwrap_or(0);
+            if notches == 0 {
+                return LRESULT(0);
+            }
             if GetKeyState(VK_SHIFT.0 as i32) < 0 {
-                with_widget(hwnd, |a, i| a.nudge(i, if delta > 0 { 4 } else { -4 }));
-            } else if delta != 0 {
-                // 1: system volume. 2: the player's own volume, falling back
-                // to system volume when the player has no mixer entry.
-                let (mode, app_id) = with_app(|a| (a.cfg.wheel_mode, a.snap.app_id.clone()))
-                    .unwrap_or((0, String::new()));
-                let level = if mode == 2 { volume::adjust(&app_id, delta > 0) } else { None };
-                match level {
-                    Some(level) => {
-                        with_app(|a| {
-                            a.volume_flash = Some((level, Instant::now()));
-                            a.refresh_volume();
-                            a.tick();
-                        });
-                    }
-                    None if mode != 0 => volume_step(delta > 0),
-                    None => {}
+                with_widget(hwnd, |a, i| a.nudge(i, 4 * notches));
+                return LRESULT(0);
+            }
+            // 1: system volume. 2: the player's own volume, falling back
+            // to system volume when the player has no mixer entry.
+            let (mode, app_id) = with_app(|a| (a.cfg.wheel_mode, a.snap.app_id.clone()))
+                .unwrap_or((0, String::new()));
+            let level = if mode == 2 { volume::adjust(&app_id, notches) } else { None };
+            match level {
+                Some(level) => {
+                    with_app(|a| {
+                        a.volume_flash = Some((level, Instant::now()));
+                        a.refresh_volume();
+                        a.tick();
+                    });
                 }
+                // The system volume, through the volume keys, so that
+                // Windows shows its own volume display: that display is how
+                // the user can tell it was the system volume that changed.
+                None if mode != 0 => {
+                    for _ in 0..notches.abs() {
+                        volume_step(notches > 0);
+                    }
+                }
+                None => {}
             }
             LRESULT(0)
         }
@@ -2160,6 +2718,8 @@ unsafe extern "system" fn mixer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         }
         WM_MOUSELEAVE => {
             with_app(|a| {
+                // A press that slides off the popup is cancelled.
+                a.popup_pressed = None;
                 if a.mixer_open && a.mixer_drag.is_none() {
                     a.mixer_hover = None;
                     a.outputs_hover = None;
@@ -2179,11 +2739,23 @@ unsafe extern "system" fn mixer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            with_app(|a| a.mixer_mouse_up());
+            let (x, y) = point(lparam);
+            if let Some((action, module)) = with_app(|a| (a.mixer_mouse_up(x, y), a.module)) {
+                perform(action, module);
+            }
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            with_app(|a| a.mixer_drag = None);
+            with_app(|a| {
+                a.mixer_drag = None;
+                a.popup_pressed = None;
+            });
+            LRESULT(0)
+        }
+        // Alt+F4 (or anything else asking the popup to close) must put it
+        // away, not destroy the one window every popup shares.
+        WM_CLOSE => {
+            with_app(|a| a.close_mixer());
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
@@ -2191,20 +2763,23 @@ unsafe extern "system" fn mixer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let (sx, sy) = point(lparam);
             let mut pt = POINT { x: sx, y: sy };
             let _ = ScreenToClient(hwnd, &mut pt);
-            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
             if delta != 0 {
-                with_app(|a| a.mixer_wheel(pt.x, pt.y, delta > 0));
+                with_app(|a| a.mixer_wheel(pt.x, pt.y, delta));
             }
             LRESULT(0)
         }
-        WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
-            with_app(|a| a.close_mixer());
+        WM_KEYDOWN => {
+            if let Some((action, module)) = with_app(|a| (a.popup_key(wparam.0 as u16), a.module)) {
+                perform(action, module);
+            }
             LRESULT(0)
         }
-        // Lost focus: the user clicked somewhere else.
+        // Lost focus: the user clicked somewhere else. (Not while a slider
+        // is being dragged; the tick closes it once the drag ends.)
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
             with_app(|a| {
-                if a.mixer_was_active {
+                if a.mixer_was_active && a.mixer_drag.is_none() {
                     a.close_mixer();
                 }
             });
@@ -2215,6 +2790,10 @@ unsafe extern "system" fn mixer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
 }
 
 unsafe extern "system" fn card_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // The one card window lives as long as the app; nothing may close it.
+    if msg == WM_CLOSE {
+        return LRESULT(0);
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
@@ -2236,7 +2815,30 @@ unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wparam: WPARAM, 
                     tray::remove(a.controller);
                 }
             });
+            reserve::restore_main();
             std::process::exit(0);
+        }
+        // Asked to close (taskkill without /f, an installer, a tool):
+        // leave properly. Letting the default handler destroy this window
+        // would leave a process with no timer and no way to end it.
+        WM_CLOSE => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        // The exe was started again while already running.
+        WM_APP_SHOW => {
+            if let Some(module) = with_app(|a| a.module) {
+                settings::open(module);
+            }
+            LRESULT(0)
+        }
+        WM_APP_RELOAD => {
+            if wparam.0 == 1 {
+                reload_config();
+            } else if !apply_pending() {
+                post_to_controller(WM_APP_RELOAD, 0);
+            }
+            LRESULT(0)
         }
         WM_APP_UPDATE => {
             with_app(|a| {
@@ -2269,45 +2871,118 @@ unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wparam: WPARAM, 
     }
 }
 
+/// Ask the copy that is already running to show its settings window.
+fn show_running_copy() {
+    unsafe {
+        if let Ok(controller) = FindWindowW(w!("TaskbarMediaController"), None) {
+            // Let it come to the front: only the process the user just
+            // started (this one) is allowed to hand that right on.
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(controller, Some(&mut pid));
+            if pid != 0 {
+                let _ = AllowSetForegroundWindow(pid);
+            }
+            let _ = PostMessageW(Some(controller), WM_APP_SHOW, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Whether the widget process `pid` is answering messages. None if its
+/// window cannot be found (it is still starting, or on its way out).
+fn widget_responds(pid: u32) -> Option<bool> {
+    unsafe {
+        let controller = FindWindowW(w!("TaskbarMediaController"), None).ok()?;
+        let mut owner = 0u32;
+        GetWindowThreadProcessId(controller, Some(&mut owner));
+        if owner != pid {
+            return None;
+        }
+        let answered =
+            SendMessageTimeoutW(controller, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 5000, None);
+        Some(answered.0 != 0)
+    }
+}
+
+/// Run the widget process until it ends. Returns its exit status, and
+/// whether it was ended here because it had stopped responding.
+fn run_widget_process(exe: &std::path::Path) -> std::io::Result<(std::process::ExitStatus, bool)> {
+    use std::os::windows::io::AsRawHandle;
+    const CHECK_EVERY_MS: u32 = 15_000;
+    const SILENT_CHECKS: u32 = 4;
+    let mut child = std::process::Command::new(exe).arg(WORKER_FLAG).spawn()?;
+    let handle = HANDLE(child.as_raw_handle() as *mut _);
+    let mut silent = 0;
+    loop {
+        // Sleeps until the widget ends, waking now and then to see that it
+        // is still answering. A widget that is stuck (not crashed) would
+        // otherwise sit frozen on the taskbar for ever.
+        if unsafe { WaitForSingleObject(handle, CHECK_EVERY_MS) } != WAIT_TIMEOUT {
+            return Ok((child.wait()?, false));
+        }
+        match widget_responds(child.id()) {
+            Some(false) => silent += 1,
+            _ => silent = 0,
+        }
+        // About a minute without an answer, checked four times over: not a
+        // slow moment (waking from sleep, a busy disk) but a hang.
+        if silent >= SILENT_CHECKS {
+            let _ = child.kill();
+            return Ok((child.wait()?, true));
+        }
+    }
+}
+
 /// The process the user starts. It shows nothing itself: it runs the widget
-/// as a second copy of this exe and starts it again if it crashes.
+/// as a second copy of this exe and starts it again if it crashes or hangs.
 fn supervise() {
     unsafe {
         // One instance only.
         let _mutex = CreateMutexW(None, true, w!("Local\\TaskbarMediaWidget"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            // Already running. Starting it again is most likely someone
+            // looking for it (nothing playing, tray icon off): show the
+            // settings window of the copy that is running.
+            show_running_copy();
             return;
         }
-        let Ok(exe) = std::env::current_exe() else { return };
-        let mut crashes: Vec<Instant> = Vec::new();
-        loop {
-            match std::process::Command::new(&exe).arg(WORKER_FLAG).status() {
-                // Exit code 0: the user chose Exit.
-                Ok(status) if status.success() => return,
-                // Ended from Task Manager (1), or by Windows shutting down:
-                // deliberate, so not something to undo.
-                Ok(status) if matches!(status.code().map(|c| c as u32), Some(1 | 0x4001_0004 | 0xC000_013A)) => {
-                    return;
-                }
-                Ok(status) => {
-                    let code = status.code().map_or("unknown".to_string(), |c| format!("{:#010x}", c as u32));
-                    crash::write(&format!("the widget stopped unexpectedly (exit code {code})"));
-                }
-                Err(error) => {
-                    crash::write(&format!("could not start the widget: {error}"));
-                    return;
-                }
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut crashes: Vec<Instant> = Vec::new();
+    loop {
+        match run_widget_process(&exe) {
+            Ok((_, true)) => {
+                crash::write("the widget stopped responding and was ended");
+                reserve::restore_main();
             }
-            // Something that crashes over and over is better left stopped.
-            crashes.retain(|at| at.elapsed() < Duration::from_secs(300));
-            crashes.push(Instant::now());
-            if crashes.len() >= 5 {
-                crash::write("crashed 5 times in 5 minutes; not restarting again");
+            // Exit code 0: the user chose Exit.
+            Ok((status, _)) if status.success() => return,
+            // Ended from Task Manager (1), or by Windows shutting down:
+            // deliberate, so not something to undo.
+            Ok((status, _)) if matches!(status.code().map(|c| c as u32), Some(1 | 0x4001_0004 | 0xC000_013A)) => {
+                reserve::restore_main();
                 return;
             }
-            std::thread::sleep(Duration::from_secs(2));
-            crash::write("restarting the widget");
+            Ok((status, _)) => {
+                let code = status.code().map_or("unknown".to_string(), |c| format!("{:#010x}", c as u32));
+                crash::write(&format!("the widget stopped unexpectedly (exit code {code})"));
+                // It had no chance to give the Windows 10 taskbar its
+                // app-button space back; do that for it.
+                reserve::restore_main();
+            }
+            Err(error) => {
+                crash::write(&format!("could not start the widget: {error}"));
+                return;
+            }
         }
+        // Something that fails over and over is better left stopped.
+        crashes.retain(|at| at.elapsed() < Duration::from_secs(300));
+        crashes.push(Instant::now());
+        if crashes.len() >= 5 {
+            crash::write("failed 5 times in 5 minutes; not restarting again");
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        crash::write("restarting the widget");
     }
 }
 
@@ -2328,11 +3003,26 @@ fn run_widget() {
         // One widget process only.
         let _mutex = CreateMutexW(None, true, w!("Local\\TaskbarMediaWidgetProcess"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            // A widget left running by a supervisor that has since been
+            // ended: it carries on, and this launch shows its settings.
+            show_running_copy();
             return;
         }
+        // For testing the supervisor (see docs/TESTING.md): crash or hang
+        // on purpose a few seconds after starting.
+        TEST_FAULT.store(
+            match std::env::var("TASKBARMEDIA_TEST").as_deref() {
+                Ok("crash") => 1,
+                Ok("hang") => 2,
+                _ => 0,
+            },
+            Ordering::Relaxed,
+        );
 
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // "Start with Windows" follows the exe if it has been moved.
+        config::refresh_autostart();
         settings::init_controls();
         render::init();
 
@@ -2465,6 +3155,7 @@ fn run_widget() {
                 widgets: Vec::new(),
                 system_light: false,
                 system_accent: 0xFF4C_C2FF,
+                accent_taskbar: false,
                 ticks: 0,
                 seek_override: None,
                 volume_flash: None,
@@ -2487,6 +3178,12 @@ fn run_widget() {
                 mixer_anchor: (0, 0, 0),
                 mixer_was_active: false,
                 mixer_away: None,
+                popup_pressed: None,
+                tick_ms: TICK_MS,
+                popup_rect: None,
+                popup_more: 0,
+                wheel_acc: 0,
+                mixer_wheel_acc: 0,
                 notice: None,
                 output: None,
             });
@@ -2499,10 +3196,22 @@ fn run_widget() {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            // Tab / Enter / Esc handling for the settings window.
+            // Tab / Enter / Esc handling for the settings window, and
+            // Ctrl+Tab to go from tab to tab.
             let dialog = settings::hwnd();
-            if !dialog.is_invalid() && IsDialogMessageW(dialog, &msg).as_bool() {
-                continue;
+            if !dialog.is_invalid() {
+                let in_dialog = msg.hwnd == dialog || IsChild(dialog, msg.hwnd).as_bool();
+                if in_dialog
+                    && msg.message == WM_KEYDOWN
+                    && msg.wParam.0 == VK_TAB.0 as usize
+                    && GetKeyState(VK_CONTROL.0 as i32) < 0
+                {
+                    settings::switch_tab(GetKeyState(VK_SHIFT.0 as i32) < 0);
+                    continue;
+                }
+                if IsDialogMessageW(dialog, &msg).as_bool() {
+                    continue;
+                }
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -2513,8 +3222,135 @@ fn run_widget() {
                 tray::remove(a.controller);
             }
         });
-        if let Ok(main) = FindWindowW(w!("Shell_TrayWnd"), None) {
-            reserve::restore(main);
+        reserve::restore_main();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marquee_waits_scrolls_waits_and_returns() {
+        let (overflow, speed) = (56.0, 28.0); // two seconds each way
+        assert_eq!(marquee_offset(overflow, 0.0, speed), 0.0);
+        assert_eq!(marquee_offset(overflow, 2.4, speed), 0.0);
+        assert!((marquee_offset(overflow, 3.5, speed) - 28.0).abs() < 0.01);
+        assert_eq!(marquee_offset(overflow, 4.6, speed), overflow);
+        assert_eq!(marquee_offset(overflow, 6.2, speed), overflow);
+        assert!((marquee_offset(overflow, 7.3, speed) - 28.0).abs() < 0.01);
+        // One full cycle later it is back at the start.
+        assert!(marquee_offset(overflow, 8.3 + 0.1, speed).abs() < 0.01);
+        // Never outside the text, whatever the time.
+        for step in 0..500 {
+            let at = marquee_offset(overflow, step as f32 * 0.07, speed);
+            assert!((0.0..=overflow).contains(&at));
         }
+        assert_eq!(marquee_offset(0.0, 5.0, speed), 0.0);
+        assert_eq!(marquee_offset(-3.0, 5.0, speed), 0.0);
+    }
+
+    #[test]
+    fn wheel_movement_adds_up_to_notches() {
+        let mut acc = 0;
+        assert_eq!(take_notches(&mut acc, 120), 1);
+        assert_eq!(take_notches(&mut acc, -120), -1);
+        // A touchpad: many small movements make one notch.
+        let mut total = 0;
+        for _ in 0..12 {
+            total += take_notches(&mut acc, 30);
+        }
+        assert_eq!(total, 3);
+        // Turning back drops the remainder instead of cancelling against it.
+        acc = 0;
+        assert_eq!(take_notches(&mut acc, 100), 0);
+        assert_eq!(take_notches(&mut acc, -100), 0);
+        assert_eq!(take_notches(&mut acc, -20), -1);
+        // A fast fling counts every notch (up to a sane limit).
+        acc = 0;
+        assert_eq!(take_notches(&mut acc, 360), 3);
+        assert_eq!(take_notches(&mut acc, 120 * 50), 8);
+    }
+
+    fn lines(mode: u32, timeline: bool, row1: bool, row2: bool) -> (String, String, String) {
+        text_lines(mode, "T".into(), "A".into(), "L".into(), timeline, row1, row2)
+    }
+
+    fn s3(a: &str, b: &str, c: &str) -> (String, String, String) {
+        (a.to_string(), b.to_string(), c.to_string())
+    }
+
+    #[test]
+    fn text_goes_where_there_is_a_row_for_it() {
+        // Title over seek bar, with a timeline.
+        assert_eq!(lines(0, true, true, true), s3("T", "A", ""));
+        assert_eq!(lines(1, true, true, true), s3("T", "A", ""));
+        assert_eq!(lines(2, true, true, true), s3("A", "T", ""));
+        // The same without a timeline: the second row is free for text.
+        assert_eq!(lines(0, false, true, true), s3("T", "", "A"));
+        assert_eq!(lines(2, false, true, true), s3("A", "", "T"));
+        assert_eq!(lines(3, false, true, true), s3("T", "", "A"));
+        assert_eq!(lines(4, false, true, true), s3("T", "", "L"));
+        // Title on its own: everything on the one row.
+        assert_eq!(lines(0, false, true, false), s3("T", "A", ""));
+        assert_eq!(lines(3, false, true, false), s3("T", "A", ""));
+        assert_eq!(lines(4, true, true, false), s3("T", "L", ""));
+        // Seek bar on its own: nothing while it shows a timeline, all of it
+        // in the bar's place when there is none.
+        assert_eq!(lines(0, true, false, true), s3("", "", ""));
+        assert_eq!(lines(0, false, false, true), s3("", "", "T \u{00B7} A"));
+        assert_eq!(lines(2, false, false, true), s3("", "", "A \u{00B7} T"));
+        assert_eq!(lines(3, false, false, true), s3("", "", "T \u{00B7} A"));
+    }
+
+    #[test]
+    fn the_title_is_never_lost() {
+        for mode in 0..=4 {
+            for timeline in [false, true] {
+                for (row1, row2) in [(true, true), (true, false), (false, true)] {
+                    if !row1 && timeline {
+                        continue; // only the seek bar, showing the timeline
+                    }
+                    let (a, b, c) = lines(mode, timeline, row1, row2);
+                    let all = format!("{a}|{b}|{c}");
+                    assert!(all.contains('T'), "mode {mode} timeline {timeline} rows {row1}/{row2}: {all}");
+                    if !row1 {
+                        assert!(a.is_empty() && b.is_empty());
+                    }
+                    if !row2 || timeline {
+                        assert!(c.is_empty(), "nothing under the title without a free row: {all}");
+                    }
+                }
+            }
+        }
+        // A track with no artist or album.
+        let (a, b, c) = text_lines(2, "T".into(), String::new(), String::new(), true, true, true);
+        assert_eq!((a.as_str(), b.as_str(), c.as_str()), ("T", "", ""));
+    }
+
+    #[test]
+    fn times_are_formatted() {
+        assert_eq!(format_time(0), "0:00");
+        assert_eq!(format_time(59 * 10_000_000), "0:59");
+        assert_eq!(format_time(222 * 10_000_000), "3:42");
+        assert_eq!(format_time(3_725 * 10_000_000), "1:02:05");
+        assert_eq!(format_time(-5), "0:00");
+    }
+
+    #[test]
+    fn the_last_resort_layout_keeps_the_essentials() {
+        let mut order = [0u8; config::ITEM_COUNT];
+        order[..5].copy_from_slice(&[
+            config::ITEM_PLAYERS,
+            config::ITEM_ART,
+            config::ITEM_PLAY,
+            config::ITEM_INFO,
+            config::ITEM_VOLUME,
+        ]);
+        let cut = essentials(&order);
+        assert_eq!(&cut[..3], &[config::ITEM_ART, config::ITEM_PLAY, 0]);
+        let mut only_text = [0u8; config::ITEM_COUNT];
+        only_text[0] = config::ITEM_INFO;
+        assert_eq!(essentials(&only_text)[0], config::ITEM_ART);
     }
 }

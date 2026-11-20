@@ -149,12 +149,83 @@ pub fn process_matches(pid: u32, app_id: &str) -> bool {
             if QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut len)
                 .is_ok()
             {
-                matched = exe_matches(&String::from_utf16_lossy(&path[..len as usize]), app_id);
+                let full = String::from_utf16_lossy(&path[..len as usize]);
+                // Sound is matched more loosely than windows are: a web
+                // app's audio comes from its browser, and some players use
+                // an id that is not their exe name at all.
+                matched = exe_matches(&full, app_id)
+                    || audio_exe(app_id).is_some_and(|exe| exe_matches(&full, &exe));
             }
         }
         let _ = CloseHandle(process);
         matched
     }
+}
+
+thread_local! {
+    /// What `audio_exe` last worked out: (app id, exe stem or "", when).
+    static AUDIO_EXE: std::cell::RefCell<Option<(String, String, std::time::Instant)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The exe (lower-case stem) whose sound belongs to a player whose id is
+/// neither an exe name nor a package: a known alias, or else the exe of the
+/// window that carries that id (how Firefox, with its per-install hashed id,
+/// is found wherever it is installed). Looking through the windows is slow,
+/// so the answer is remembered for a while.
+fn audio_exe(app_id_lower: &str) -> Option<String> {
+    if let Some(alias) = exe_alias(app_id_lower) {
+        return Some(alias.to_string());
+    }
+    // Packaged apps are matched by package identity, and ids that are exe
+    // names by name; neither needs this.
+    if app_id_lower.contains('!') || app_id_lower.ends_with(".exe") {
+        return None;
+    }
+    let cached = AUDIO_EXE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(id, _, at)| id == app_id_lower && at.elapsed() < std::time::Duration::from_secs(30))
+            .map(|(_, exe, _)| exe.clone())
+    });
+    let exe = cached.unwrap_or_else(|| {
+        let found = unsafe { find_window_by_id(app_id_lower) }
+            .and_then(|hwnd| {
+                let mut pid = 0u32;
+                unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+                process_exe(pid)
+            })
+            .and_then(|name| Path::new(&name).file_stem().and_then(|s| s.to_str()).map(|s| s.to_lowercase()))
+            .unwrap_or_default();
+        AUDIO_EXE.with(|c| {
+            *c.borrow_mut() = Some((app_id_lower.to_string(), found.clone(), std::time::Instant::now()));
+        });
+        found
+    });
+    (!exe.is_empty()).then_some(exe)
+}
+
+/// The first visible top-level window whose own AppUserModelID is `app_id`.
+unsafe fn find_window_by_id(app_id_lower: &str) -> Option<HWND> {
+    let mut search = Search { app_id: app_id_lower.to_string(), found: None };
+    let _ = EnumWindows(Some(enum_by_id), LPARAM(&mut search as *mut Search as isize));
+    search.found
+}
+
+unsafe extern "system" fn enum_by_id(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = &mut *(lparam.0 as *mut Search);
+    if !IsWindowVisible(hwnd).as_bool() {
+        return true.into();
+    }
+    if let Ok(store) = SHGetPropertyStoreForWindow::<IPropertyStore>(hwnd) {
+        if let Ok(value) = store.GetValue(&PKEY_AppUserModel_ID) {
+            if value.to_string().to_lowercase() == search.app_id {
+                search.found = Some(hwnd);
+                return false.into();
+            }
+        }
+    }
+    true.into()
 }
 
 /// The exe file name of a running process, for example "Spotify.exe".
@@ -182,6 +253,9 @@ pub fn display_name(app_id: &str) -> String {
         ("chrome", "Google Chrome"),
         ("firefox", "Firefox"),
         ("308046b0af4a39cb", "Firefox"),
+        ("e7cf176e110c211b", "Firefox"),
+        ("6f193ccc56814779", "Firefox"),
+        ("cfdb4b0b8dcd4e5c", "Firefox"),
         ("brave", "Brave"),
         ("opera", "Opera"),
         ("vivaldi", "Vivaldi"),
@@ -216,6 +290,25 @@ fn exe_matches(path_or_name: &str, app_id_lower: &str) -> bool {
     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
     let stem = p.file_stem().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
     !name.is_empty() && (name == app_id_lower || stem == app_id_lower)
+}
+
+/// Players whose media-session id is neither their exe name nor a package
+/// identity: the exe stem (lower case) their audio comes from. Only for
+/// matching sound (see `audio_exe`); windows are matched by the id itself,
+/// so that "open the player" brings up a web app and not its browser.
+fn exe_alias(app_id_lower: &str) -> Option<&str> {
+    // Firefox reports a hash of its install path (release, then other
+    // channels); the usual ones are listed.
+    const FIREFOX: [&str; 4] =
+        ["308046b0af4a39cb", "e7cf176e110c211b", "6f193ccc56814779", "cfdb4b0b8dcd4e5c"];
+    if FIREFOX.contains(&app_id_lower) || app_id_lower.starts_with("mozilla.firefox") {
+        return Some("firefox");
+    }
+    // Installed web apps: "Chrome._crx_abc...", "MSEdge._crx_...", "Brave._crx_...".
+    if let Some((browser, _)) = app_id_lower.split_once("._crx_") {
+        return Some(browser);
+    }
+    None
 }
 
 unsafe fn running_process_path(app_id: &str) -> Option<String> {
@@ -256,4 +349,40 @@ unsafe fn running_process_path(app_id: &str) -> Option<String> {
     }
     let _ = CloseHandle(snapshot);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exe_names_match_app_ids() {
+        assert!(exe_matches("Spotify.exe", "spotify.exe"));
+        if cfg!(windows) {
+            assert!(exe_matches("C:\\Users\\a\\AppData\\Roaming\\Spotify\\Spotify.exe", "spotify.exe"));
+        }
+        assert!(exe_matches("chrome.exe", "chrome"));
+        assert!(!exe_matches("chrome.exe", "chrome._crx_abc"));
+        assert!(!exe_matches("", "spotify.exe"));
+        assert!(!exe_matches("notspotify.exe", "spotify.exe"));
+    }
+
+    #[test]
+    fn aliases_are_for_sound_only() {
+        assert_eq!(exe_alias("308046b0af4a39cb"), Some("firefox"));
+        assert_eq!(exe_alias("chrome._crx_abcdef"), Some("chrome"));
+        assert_eq!(exe_alias("msedge._crx_abcdef"), Some("msedge"));
+        assert_eq!(exe_alias("spotify.exe"), None);
+        assert_eq!(exe_alias("spotifyab.spotifymusic_zpdnekdrzrea0!spotify"), None);
+    }
+
+    #[test]
+    fn readable_names() {
+        assert_eq!(display_name("Spotify.exe"), "Spotify");
+        assert_eq!(display_name("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"), "Spotify");
+        assert_eq!(display_name("308046B0AF4A39CB"), "Firefox");
+        assert_eq!(display_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"), "Media Player");
+        assert_eq!(display_name("SomePlayer.exe"), "SomePlayer");
+        assert_eq!(display_name("Acme.Tunes_abc123!App"), "Tunes");
+    }
 }

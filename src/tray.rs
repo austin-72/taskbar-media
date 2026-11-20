@@ -8,7 +8,7 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXSMICON, SM_CYSMICON,
+    DestroyIcon, GetSystemMetrics, LoadImageW, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXSMICON, SM_CYSMICON,
     WM_APP,
 };
 
@@ -47,14 +47,23 @@ fn icon(module: HINSTANCE) -> HICON {
     }
 }
 
-pub fn add(hwnd: HWND, module: HINSTANCE, tip: &str) {
+/// Returns false if Windows did not take the icon (Explorer is still
+/// starting at sign-in, say); the caller tries again later.
+pub fn add(hwnd: HWND, module: HINSTANCE, tip: &str) -> bool {
     let mut nid = data(hwnd);
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = icon(module);
     set_tip(&mut nid, tip);
     unsafe {
-        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        // An icon left from before (Explorer restarted) would make the add
+        // fail; modifying it instead is just as good.
+        let ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool() || Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
+        // The shell keeps its own copy of the icon.
+        if !nid.hIcon.is_invalid() {
+            let _ = DestroyIcon(nid.hIcon);
+        }
+        ok
     }
 }
 

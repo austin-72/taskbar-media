@@ -7,6 +7,10 @@
 //! puts the width back whenever it re-lays out the taskbar, so this is
 //! re-applied on every tick, and undone when the widget hides or exits.
 //!
+//! The edge the area was narrowed to is also remembered in the registry, so
+//! that if the widget is killed or crashes, the supervisor (or the next run)
+//! can still recognise the change as its own and undo it.
+//!
 //! Windows 11 draws its taskbar differently and offers nothing equivalent;
 //! there the widget shrinks instead (see `probe`).
 
@@ -38,6 +42,28 @@ pub fn supported() -> bool {
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The right edge (screen x) the button area was last narrowed to.
 static TARGET: AtomicI32 = AtomicI32::new(0);
+static RECOVERED: AtomicBool = AtomicBool::new(false);
+
+const STATE_NAME: windows::core::PCWSTR = w!("ReservedEdge");
+
+/// Once per process: pick up a reservation left behind by a run that did
+/// not get to undo it.
+fn recover() {
+    if RECOVERED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let saved = crate::config::state_get(STATE_NAME) as i32;
+    if saved != 0 && !ACTIVE.load(Ordering::Relaxed) {
+        TARGET.store(saved, Ordering::Relaxed);
+        ACTIVE.store(true, Ordering::Relaxed);
+    }
+}
+
+fn remember(target: i32) {
+    if TARGET.swap(target, Ordering::Relaxed) != target || !ACTIVE.load(Ordering::Relaxed) {
+        crate::config::state_set(STATE_NAME, target as u32);
+    }
+}
 
 struct Parts {
     rebar: HWND,
@@ -76,6 +102,7 @@ unsafe fn set_right_edge(p: &Parts, right: i32) {
 /// left of the widget. Returns false, changing nothing, if this taskbar is
 /// not laid out the way this code expects.
 pub fn apply(taskbar: HWND, right: i32) -> bool {
+    recover();
     unsafe {
         let Some(p) = parts(taskbar) else { return false };
         let full = p.rebar_rect.right;
@@ -96,7 +123,7 @@ pub fn apply(taskbar: HWND, right: i32) -> bool {
         if (current - right).abs() > 1 {
             set_right_edge(&p, right);
         }
-        TARGET.store(right, Ordering::Relaxed);
+        remember(right);
         ACTIVE.store(true, Ordering::Relaxed);
         true
     }
@@ -104,14 +131,31 @@ pub fn apply(taskbar: HWND, right: i32) -> bool {
 
 /// Give the app-button area its full width back.
 pub fn restore(taskbar: HWND) {
+    recover();
     if !ACTIVE.swap(false, Ordering::Relaxed) {
         return;
     }
+    crate::config::state_set(STATE_NAME, 0);
     unsafe {
         let Some(p) = parts(taskbar) else { return };
         // Only undo our own change; Explorer may already have reset it.
         if (p.tasks_rect.right - TARGET.load(Ordering::Relaxed)).abs() <= 1 {
             set_right_edge(&p, p.rebar_rect.right);
         }
+    }
+}
+
+/// Undo a reservation on the main taskbar, whichever process made it. For
+/// the supervisor (after the widget died) and the shutdown paths.
+pub fn restore_main() {
+    if !supported() {
+        return;
+    }
+    // Look at the registry afresh every time: the supervisor calls this
+    // after each time the widget dies, and each of those runs of the widget
+    // may have left a reservation of its own.
+    RECOVERED.store(false, Ordering::Relaxed);
+    if let Ok(main) = unsafe { windows::Win32::UI::WindowsAndMessaging::FindWindowW(w!("Shell_TrayWnd"), None) } {
+        restore(main);
     }
 }
